@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# CMake / build
+build/
+build-*/
+*.cmake.bak
+CMakeCache.txt
+CMakeFiles/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Claude Code / per-machine MCP configuration
+.claude/
+.mcp.json
+
+# Local secrets — extension reads creds from QSettings, never from a file in-repo
+*.env
+*.pem
+*.key
+!*.pub.key
