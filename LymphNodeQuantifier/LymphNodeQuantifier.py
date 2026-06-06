@@ -100,6 +100,45 @@ class LymphNodeQuantifierLogic(ScriptedLoadableModuleLogic):
         return seg
 
     @staticmethod
+    def loadProbabilityMap(probPath, entry, volumeNode):
+        """Load a single-channel float probability NRRD as a scalar volume,
+        apply a heat-mapped color table, and overlay it over `volumeNode`
+        in the slice views. Replaces any prior probability volume for the
+        same (model, CT) pair so repeat runs don't pile up nodes."""
+        name = f"LNQ:prob-{entry['name']}-{volumeNode.GetName()}"
+        existing = slicer.util.getFirstNodeByName(name)
+        if existing is not None:
+            slicer.mrmlScene.RemoveNode(existing)
+        vol = slicer.util.loadVolume(probPath, properties={"show": False})
+        if vol is None:
+            raise RuntimeError(f"failed to load probability map {probPath}")
+        vol.SetName(name)
+        disp = vol.GetDisplayNode()
+        if disp is not None:
+            # FullRainbow reads well over greyscale CT; clamp window to 0..1
+            # so a colored voxel directly means "model thought it was a LN
+            # with this probability."
+            ct_node = slicer.mrmlScene.GetFirstNodeByClass(
+                "vtkMRMLColorTableNode")
+            heatmap = slicer.util.getFirstNodeByName(
+                "Inferno") or slicer.util.getFirstNodeByName("FullRainbow")
+            if heatmap is not None:
+                disp.SetAndObserveColorNodeID(heatmap.GetID())
+            disp.SetAutoWindowLevel(False)
+            disp.SetWindowLevelMinMax(0.0, 1.0)
+            disp.SetThreshold(0.05, 1.0)
+            disp.SetApplyThreshold(True)
+        # Show as the foreground over the CT in all slice views.
+        composite = slicer.app.applicationLogic().GetSelectionNode()
+        layoutManager = slicer.app.layoutManager()
+        for c in layoutManager.sliceViewNames():
+            sliceLogic = layoutManager.sliceWidget(c).sliceLogic()
+            cn = sliceLogic.GetSliceCompositeNode()
+            cn.SetForegroundVolumeID(vol.GetID())
+            cn.SetForegroundOpacity(0.4)
+        return vol
+
+    @staticmethod
     def getOrCreateComposite(volumeNode):
         """Return the composite SegmentationNode for `volumeNode`, creating it
         on first use. One composite per CT — repeat runs on the same CT
@@ -180,6 +219,7 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
         self._queueIndex: int = 0
         self._currentEntry: Optional[dict] = None
         self._currentOutputPath: Optional[str] = None
+        self._currentProbPath: Optional[str] = None
         self._compositeSeg = None
         self._allOutputPaths: list = []   # for cleanup at end of run
         self._downloadBytesTotal: dict = {}
@@ -274,15 +314,28 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
 
     def _buildRunSection(self):
         box = qt.QGroupBox("Run")
-        lay = qt.QHBoxLayout(box)
+        lay = qt.QVBoxLayout(box)
+
+        # Optional: emit the foreground probability map alongside the SEG.
+        # Useful for inspecting "ballpark vs missed the mark" on OOD cases
+        # and as the seed signal for the Review tab's paint tools.
+        self._saveProbCheckbox = qt.QCheckBox(
+            "Save probability map (Inferno overlay on the CT)")
+        self._saveProbCheckbox.setToolTip(
+            "Write the 5-fold-averaged foreground softmax as a scalar volume "
+            "in addition to the SEG. Visualizes confidence per voxel.")
+        lay.addWidget(self._saveProbCheckbox)
+
+        row = qt.QHBoxLayout()
         self._runButton = qt.QPushButton("Run selected")
         self._runButton.setDefault(True)
         self._runButton.connect("clicked()", self._onRunClicked)
         self._cancelButton = qt.QPushButton("Cancel")
         self._cancelButton.enabled = False
         self._cancelButton.connect("clicked()", self._onCancelClicked)
-        lay.addWidget(self._runButton, 1)
-        lay.addWidget(self._cancelButton, 0)
+        row.addWidget(self._runButton, 1)
+        row.addWidget(self._cancelButton, 0)
+        lay.addLayout(row)
         return box
 
     def _buildProgressSection(self):
@@ -410,6 +463,7 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
         # Allocate one output path per region; deleted only after the full
         # batch finishes (so a mid-batch cancel still leaves partial NRRDs
         # available for inspection).
+        save_prob = self._saveProbCheckbox.isChecked()
         self._queue = []
         self._allOutputPaths = []
         for entry in selected:
@@ -418,7 +472,16 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
                 prefix=f"lnq-{entry['name']}-")
             out_fd.close()
             os.remove(out_fd.name)  # let lnq-segmenter create it
-            self._queue.append((entry, out_fd.name))
+            prob_path = None
+            if save_prob:
+                prob_fd = tempfile.NamedTemporaryFile(
+                    suffix=".nrrd", delete=False,
+                    prefix=f"lnq-{entry['name']}-prob-")
+                prob_fd.close()
+                os.remove(prob_fd.name)
+                prob_path = prob_fd.name
+                self._allOutputPaths.append(prob_path)
+            self._queue.append((entry, out_fd.name, prob_path))
             self._allOutputPaths.append(out_fd.name)
         self._queueIndex = 0
 
@@ -431,13 +494,14 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
         self._startNextInQueue()
 
     def _startNextInQueue(self):
-        """Pop the next (entry, output_path) and spawn its predict run."""
+        """Pop the next (entry, output_path, prob_path) and spawn its run."""
         if self._queueIndex >= len(self._queue):
             self._onBatchDone()
             return
-        entry, output_path = self._queue[self._queueIndex]
+        entry, output_path, prob_path = self._queue[self._queueIndex]
         self._currentEntry = entry
         self._currentOutputPath = output_path
+        self._currentProbPath = prob_path
 
         self._downloadBytesTotal.clear()
         self._downloadBytesDone.clear()
@@ -460,6 +524,7 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
             f"{entry['name']}@{entry['version']}",
             self._inputTempPath, output_path,
             device=self._deviceCombo.currentText,
+            probability_output=prob_path,
         )
 
     def _onCancelClicked(self):
@@ -542,6 +607,15 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
             except Exception as exc:
                 logging.exception("merge into composite failed")
                 self._appendLog(f"-> merge failed: {exc}")
+            if self._currentProbPath and os.path.isfile(self._currentProbPath):
+                try:
+                    vol = self.logic.loadProbabilityMap(
+                        self._currentProbPath, entry,
+                        self._inputSelector.currentNode())
+                    self._appendLog(f"-> loaded probability map '{vol.GetName()}'")
+                except Exception as exc:
+                    logging.exception("loadProbabilityMap failed")
+                    self._appendLog(f"-> probability load failed: {exc}")
             self._queueIndex += 1
             self._startNextInQueue()
             return
@@ -567,6 +641,7 @@ class LymphNodeQuantifierWidget(ScriptedLoadableModuleWidget):
         self._queueIndex = 0
         self._currentEntry = None
         self._currentOutputPath = None
+        self._currentProbPath = None
         # Don't clear _compositeSeg — leave it visible in the scene; next
         # run on the same CT will find it via getOrCreateComposite.
 

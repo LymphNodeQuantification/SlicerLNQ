@@ -68,7 +68,7 @@ class SegmenterRunner(qt.QObject):
     # ----- control -----
 
     def start_predict(self, model_spec, input_path, output_path,
-                      device="cuda", folds=None):
+                      device="cuda", folds=None, probability_output=None):
         """Spawn PythonSlicer -m lnq_segmenter predict … --json-progress."""
         args = [
             "-m", "lnq_segmenter", "predict", model_spec,
@@ -80,6 +80,8 @@ class SegmenterRunner(qt.QObject):
         if folds:
             args.append("--folds")
             args.extend(str(f) for f in folds)
+        if probability_output:
+            args.extend(["--probability-output", probability_output])
         self._cancelled = False
         self._process.start(slicer_python_executable(), args)
 
