@@ -134,6 +134,21 @@ tools work on the model SEG:
 - Action: delete the connected component of the model SEG segment
   containing the click point.
 
+### Case-level outcomes (full design in [review-deployment.md](review-deployment.md#case-level-outcomes))
+
+In addition to per-voxel edits, the reviewer picks one of four
+case-level exit actions: Save & next, Skip, **Reject — poor quality**,
+or Escalate. Reject prompts a small reason picker (motion, contrast
+bolus, missing slices, slice thickness, other-with-text) and the
+case's Annotation gets `quality_flag = rejected_poor_quality` plus
+the picked reason — keeping it out of any future training set built
+from these reviews.
+
+A persistent free-text **case notes** field lives above the action
+buttons and is saved on the Annotation regardless of the exit action.
+Useful for "ask Tagwa to confirm SVC location", "patient has surgical
+clips", flagging interesting cases, anything else.
+
 ### Confidence threshold slider
 
 - Log-scaled range 10⁻⁵ → 1, default 0.001.
