@@ -2,6 +2,12 @@
 
 Status: spec only; not yet implemented (as of `lnq-segmenter` v0.2.3).
 
+Companion document: [review-deployment.md](review-deployment.md) covers
+how this tab gets delivered to reviewers — Slicer over remote desktop
+rather than a custom web app. The interaction design specified here is
+identical whether the reviewer is running Slicer on their laptop or in
+a browser tab pointing at a hosted instance.
+
 ## Why this exists
 
 The four phase-2 models (inguinal-v1, abdominopelvic-v1, axillary-v1,
