@@ -98,15 +98,7 @@ def hideChrome():
     # Inside the module panel, hide the header chrome (Help &
     # Acknowledgement, Reload & Test) since this module is meant to be
     # used by non-developers.
-    moduleSelector = slicer.util.findChild(main, "ModulePanel")
-    if moduleSelector is not None:
-        # Hide the module name label + collapsibles we don't need.
-        for cb in moduleSelector.findChildren(qt.QObject):
-            if not isinstance(cb, qt.QWidget):
-                continue
-            text = cb.windowTitle if hasattr(cb, "windowTitle") else ""
-            if text in ("Help & Acknowledgement", "Reload & Test"):
-                cb.setVisible(False)
+    _setModulePanelHelpVisible(main, False)
 
     # Switch to the single-Red-slice layout.
     layoutId = installLayout()
@@ -129,13 +121,21 @@ def restoreChrome(state):
     for dw in main.findChildren(qt.QDockWidget):
         if dw.objectName in state.dockWidgets:
             dw.setVisible(state.dockWidgets[dw.objectName])
-    # Unhide the Help/Reload sections inside the module panel.
-    moduleSelector = slicer.util.findChild(main, "ModulePanel")
-    if moduleSelector is not None:
-        for cb in moduleSelector.findChildren(qt.QObject):
-            if isinstance(cb, qt.QWidget):
-                text = cb.windowTitle if hasattr(cb, "windowTitle") else ""
-                if text in ("Help & Acknowledgement", "Reload & Test"):
-                    cb.setVisible(True)
+    _setModulePanelHelpVisible(main, True)
     if state.layoutId is not None:
         slicer.app.layoutManager().setLayout(state.layoutId)
+
+
+# ctk's collapsible button uses .text (with "&&" for the mnemonic) rather
+# than windowTitle. Match by objectName ("HelpCollapsibleButton",
+# "ReloadCollapsibleButton") since those are stable across Slicer versions.
+_HEADER_OBJECT_NAMES = ("HelpCollapsibleButton", "ReloadCollapsibleButton")
+
+
+def _setModulePanelHelpVisible(main, visible):
+    mp = slicer.util.findChild(main, "ModulePanel") if main is not None else None
+    if mp is None:
+        return
+    for w in mp.findChildren(qt.QWidget):
+        if w.objectName in _HEADER_OBJECT_NAMES:
+            w.setVisible(visible)

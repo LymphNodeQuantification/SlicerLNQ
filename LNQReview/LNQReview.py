@@ -310,7 +310,8 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
     def _buildActionsSection(self):
         box = qt.QGroupBox("Actions")
         v = qt.QVBoxLayout(box)
-        self._saveButton = qt.QPushButton("✓  Save & next  (Enter)")
+        # Double-ampersand escapes Qt's mnemonic so users see "&" literally.
+        self._saveButton = qt.QPushButton("✓  Save && next  (Enter)")
         self._saveButton.setDefault(True)
         self._saveButton.setStyleSheet("font-weight: bold; padding: 6px;")
         self._saveButton.connect("clicked()", self._onSaveAndNext)
