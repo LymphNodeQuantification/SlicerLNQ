@@ -45,26 +45,51 @@ the rest of the system:
 
 ## Empirical priors (from MED_LYMPH_021 inspection)
 
-The first probability-map study (mediastinal-v1 vs the NIH GT on
-MED_LYMPH_021) found the model output is sharply **bimodal**:
+The probability map on MED_LYMPH_021 (mediastinal-v1 vs NIH GT, default
+window) looks bimodal — TPs and FPs sit around p = 0.91, missed voxels
+around p = 0.003 — but that picture is misleading. A linear colormap
+windowed to [0, 1] flattens everything below ~0.05 into "looks like
+background." The structure is at the *low* end, on a log scale.
 
-| population | n voxels | mean p | median p | % with p ≥ 0.3 |
-|---|---:|---:|---:|---:|
-| true positives | 36,850 | 0.91 | 0.98 | 100 % |
-| false positives | 5,197 | 0.91 | 0.98 | 100 % |
-| **missed (GT only)** | **83,360** | **0.045** | **0.003** | **4.1 %** |
-| background | 14.5 M | 4 × 10⁻⁵ | ~0 | ~0 % |
+When you compare missed-GT voxels against true-background voxels at
+small thresholds, the missed region is enriched 600–1000× over
+background out to extremely low probability cutoffs:
 
-What this tells the tab design: on out-of-distribution NIH-style cases,
-**threshold-grow at p ≥ 0.3 only recovers ~4 % of the missed nodes.**
-The model isn't "almost seeing" the missed regions; for the median
-missed voxel it's claiming p = 0.003, indistinguishable from
-background. Probability-seeded grow is therefore *not the primary
-correction mechanism* on these cases — it's a fast-path for the small
-slice of nodes where confidence is borderline. The main mechanism is
-classic paint, with the probability overlay as a *guide* (so the
-reviewer can spot at a glance "the model didn't even consider this
-region a candidate" and head straight there).
+| threshold | missed-GT % above | bg % above | enrichment |
+|---:|---:|---:|---:|
+| 1 × 10⁻⁴ | 72.5 % | 0.12 % | 600 × |
+| 1 × 10⁻³ | 58.7 % | 0.07 % | **836 ×** |
+| 5 × 10⁻³ | 44.0 % | 0.05 % | 928 × |
+| 1 × 10⁻² | 36.7 % | 0.04 % | 954 × |
+| 5 × 10⁻² | 21.6 % | 0.02 % | 1035 × |
+| 0.3 | 4.1 % | 4 × 10⁻⁵ | 929 × |
+
+The model is *whispering* about the missed regions — confidence is real
+but compressed against zero by the softmax. Re-thresholding the same
+probability map at p ≥ 0.001 (instead of the default argmax-equivalent
+0.5) on this case lifts Dice 0.45 → **0.78** with precision unchanged:
+
+| threshold | Dice | sensitivity | precision |
+|---:|---:|---:|---:|
+| 0.001 | **0.775** | 0.714 | 0.848 |
+| 0.005 | 0.714 | 0.611 | 0.859 |
+| 0.01 | 0.680 | 0.561 | 0.862 |
+| 0.1 | 0.556 | 0.408 | 0.872 |
+| 0.5 (default) | 0.454 | 0.307 | 0.876 |
+
+What this tells the tab design:
+
+- The seed-grow mechanic absolutely works — but the threshold for
+  "where the model is signaling" lives down at **0.001–0.01**, not 0.3.
+- The threshold slider should be **log-scaled** (e.g. 10⁻⁵ → 1) so the
+  reviewer can actually navigate the working range.
+- The Inferno overlay needs to be displayed against a log-scaled
+  colormap or a window like [0, 0.05] by default, otherwise the whisper
+  is invisible.
+- The tab is also where per-case (or per-collection) threshold tuning
+  surfaces: a "find best threshold against reference GT" button that
+  sweeps the curve above and snaps the slider to the Dice argmax is
+  cheap and immediately useful.
 
 ## Core interaction: probability-seeded confirm + delete
 
@@ -82,21 +107,19 @@ tools work on the model SEG:
 - Mouse cursor: crosshair with a `+` glyph.
 - Click on a pixel that the reference GT covers but the model SEG
   doesn't.
-- Behavior depends on what the probability map shows at the click:
-  1. If a connected component of voxels with p ≥ threshold (default
-     0.3, sticky per session) intersects the click, accept that whole
-     component as a new region of the model SEG segment — single
-     click, no painting. This is the fast path for the small slice
-     of cases where the model is "hesitant".
-  2. Otherwise (the empirically dominant case on NIH-style data: the
-     model gave p ≈ 0.003 in the missed region), drop into a small
-     sphere brush primed at the click location. The expert paints
-     the node by hand, but the Inferno overlay is still visible so
-     the borders of the GT outline guide them.
-- Why the dual mode: the MED_LYMPH_021 study showed only ~4 % of
-  missed voxels were above p ≥ 0.3, so the seed-grow path is the
-  exception, not the rule. The fallback paint with the GT outline as
-  a guide is what actually does the work on cases like these.
+- Action: grow the model's probability-map connected component above
+  the current threshold (default 0.001, log-scaled slider 10⁻⁵ → 1)
+  at the click point. The grown component becomes a new region of the
+  model SEG segment.
+- The default sits orders of magnitude below the argmax cutoff because
+  that's where the empirical signal lives — see "Empirical priors"
+  above. The slider is log-scaled so the reviewer can move it across
+  the working range without spending the whole travel between 0.3
+  and 1.0.
+- If no probability voxels above threshold connect to the click point
+  (the model truly didn't see anything there — rare but possible at
+  high thresholds or on hard cases), fall back to a small sphere
+  brush primed at the click location.
 
 ### "Remove a false positive" (Delete tool)
 
@@ -107,11 +130,55 @@ tools work on the model SEG:
 
 ### Confidence threshold slider
 
-- Range 0.05 → 0.95, default 0.3.
-- Live-updates the Inferno overlay's lower threshold so the expert can
-  see what would-be-added regions look like at different cutoffs.
+- Log-scaled range 10⁻⁵ → 1, default 0.001.
+- Live-updates the Inferno overlay's lower threshold and the Add
+  tool's seed-grow cutoff together so what the reviewer can *see* is
+  exactly what a click would *accept*.
 - Sticky per session (QSettings), per-anatomy if we want to fine-tune
   later.
+- "Best vs reference" button — sweeps the threshold curve against the
+  loaded reference GT and snaps to argmax Dice. On MED_LYMPH_021 this
+  finds ~0.001 and lifts Dice 0.45 → 0.78 with no painting. Great
+  starting point before the reviewer manually fine-tunes.
+
+### Point/scribble prompts (a more general way to tune the threshold)
+
+The "Best vs reference" button assumes a reference GT exists. Often it
+won't — and even when it does, the reference may be in a different
+inclusion regime than what we actually want (NIH includes borderline
+nodes our experts wouldn't, our experts include nodes NIH skipped).
+Point/scribble prompts solve both:
+
+- Two tools on the toolbar: **Positive (this is LN)** and **Negative
+  (this is not LN)**. The reviewer plants a handful of each — single
+  clicks become 1-voxel point landmarks, drag becomes a short scribble
+  (a thin polyline of points). The interaction model mirrors what
+  Segment Editor's "Paint" tool does, just at much sparser sampling.
+- The points are stored as `vtkMRMLMarkupsFiducialNode`s named
+  `LNQ:review-pos-*` and `LNQ:review-neg-*` so they live in the scene
+  next to the probability volume and survive a Save/Load round-trip.
+- A **"Tune threshold to prompts"** action then takes the labelled
+  points as a tiny ground-truth set and sweeps the threshold to
+  maximise an objective the reviewer cares about (default: balanced
+  accuracy on the prompt set, optionally Youden's J or weighted-toward-
+  recall). The resulting threshold gets snapped onto the slider, the
+  Inferno overlay re-windows, and the Add tool's seed-grow cutoff
+  updates in lockstep.
+- This is the workhorse for cases without a reference: ~30 seconds of
+  expert clicking gives the probability map a personally-calibrated
+  cutoff, then a few seed-grow clicks finish the segmentation. The
+  resulting Annotation carries the prompts (so the calibration is
+  auditable) in addition to the corrected mask.
+
+Optional integration path — **nnInteractive / scribble-prompt model**:
+the same prompt points can be passed to an external interactive
+segmentation network (e.g. nnInteractive, SAM-medical, ScribblePrompt)
+running over the CT instead of our anatomy model's probability map.
+Output is a candidate segmentation that the reviewer accepts, rejects,
+or further corrects. We'd surface this as a separate "Run interactive
+model" button rather than mixing it with the threshold tuning so the
+two paths stay readable. nnInteractive integration is post-v1 — the
+prompt UI itself is reusable across both backends.
 
 ## Save behavior
 
@@ -158,23 +225,34 @@ whole point: the corrections only matter if we can prove they help.
 | 2 | m | reference-GT loader: DICOM SEG via pydicom-seg fallback (QR not always present) |
 | 3 | m | probability-map seed grow (connected-component above threshold + click point) |
 | 4 | s | Add/Delete tool buttons + cursor glyphs |
-| 5 | s | confidence-threshold slider with live Inferno re-window |
-| 6 | m | Save → chronicle Annotation + blob upload |
-| 7 | s | Train tab: "include expert-corrected reviews" checkbox |
+| 5 | s | confidence-threshold slider (log-scale) with live Inferno re-window |
+| 6 | m | positive/negative prompt tools + "Tune threshold to prompts" action |
+| 7 | m | Save → chronicle Annotation + blob upload (incl. prompt points for audit) |
+| 8 | s | Train tab: "include expert-corrected reviews" checkbox |
 
 Total: ~1–2 weeks for one person.
 
 ## Why these reviews matter for the next training round
 
-The MED_LYMPH_021 numbers above frame the value proposition: the model
-is *confidently wrong* on the regions it misses (p ≈ 0.003), not
-borderline. That makes these the strongest possible kind of hard
-negative — every corrected case directly contradicts a high-confidence
-prediction the model would have made on similar future cases. Adding
-them to the training set should push generalization much harder than
-another batch of in-distribution Tagwa cases would. The Train tab's
-"Include expert-corrected reviews" toggle is what lets us actually
-measure that with controlled A/B runs.
+The MED_LYMPH_021 study reframes the model behavior on OOD cases:
+**it's not blind to most missed nodes, it's miscalibrated against
+them.** That's actually the easier failure mode to fix — recalibration
+techniques (temperature scaling, Platt scaling on a held-out set)
+exist and could lift real-world Dice without retraining at all.
+
+But reviews still matter for two reasons:
+
+- **Calibration data needs labels.** Per-collection threshold tuning
+  needs reference GT, and corrected reviews are higher-quality GT
+  than raw NIH annotations.
+- **Hard cases that the model genuinely missed at p ≈ 0** are still
+  the strongest training signal. On MED_LYMPH_021 those are a smaller
+  fraction (~30 %) of missed-GT voxels than the whisper-but-below-
+  threshold majority, but they're the ones where retraining would
+  actually teach the model something new.
+
+The Train tab's "Include expert-corrected reviews" toggle is what lets
+us do controlled A/B runs to measure both effects.
 
 ## Out of scope for v1
 
@@ -184,6 +262,10 @@ measure that with controlled A/B runs.
   tab feature for later.
 - Dictation / structured reports — radiologist-grade reporting is a
   bigger surface and isn't the differentiator here.
+- nnInteractive / SAM-medical / ScribblePrompt backends behind the
+  prompt UI. The prompt collection itself is in v1 (drives threshold
+  tuning); routing prompts to an external interactive-segmentation
+  model is a later integration.
 
 ## Open questions
 
