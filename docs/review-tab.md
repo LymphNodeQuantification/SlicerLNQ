@@ -43,6 +43,29 @@ the rest of the system:
    `--probability-output` flag, loaded as a scalar volume with an
    Inferno colormap clamped to [0, 1].
 
+## Empirical priors (from MED_LYMPH_021 inspection)
+
+The first probability-map study (mediastinal-v1 vs the NIH GT on
+MED_LYMPH_021) found the model output is sharply **bimodal**:
+
+| population | n voxels | mean p | median p | % with p ≥ 0.3 |
+|---|---:|---:|---:|---:|
+| true positives | 36,850 | 0.91 | 0.98 | 100 % |
+| false positives | 5,197 | 0.91 | 0.98 | 100 % |
+| **missed (GT only)** | **83,360** | **0.045** | **0.003** | **4.1 %** |
+| background | 14.5 M | 4 × 10⁻⁵ | ~0 | ~0 % |
+
+What this tells the tab design: on out-of-distribution NIH-style cases,
+**threshold-grow at p ≥ 0.3 only recovers ~4 % of the missed nodes.**
+The model isn't "almost seeing" the missed regions; for the median
+missed voxel it's claiming p = 0.003, indistinguishable from
+background. Probability-seeded grow is therefore *not the primary
+correction mechanism* on these cases — it's a fast-path for the small
+slice of nodes where confidence is borderline. The main mechanism is
+classic paint, with the probability overlay as a *guide* (so the
+reviewer can spot at a glance "the model didn't even consider this
+region a candidate" and head straight there).
+
 ## Core interaction: probability-seeded confirm + delete
 
 The expert opens the tab and sees the CT with three overlays:
@@ -59,19 +82,21 @@ tools work on the model SEG:
 - Mouse cursor: crosshair with a `+` glyph.
 - Click on a pixel that the reference GT covers but the model SEG
   doesn't.
-- Action: grow the model's probability-map connected component above a
-  user-chosen threshold (default 0.3, sticky per session) at that
-  click. The grown component becomes a new region of the model SEG
-  segment.
-- Why this works: even on conservative predictions, the probability map
-  usually shows 0.2–0.5 confidence in the missed-node region. The
-  threshold-grow gives us "one click = one node added" with the
-  model's own shape estimate, instead of asking the expert to paint
-  the boundary.
-- If no probability voxels above threshold connect to the click point,
-  fall back to a small sphere brush (configurable radius) so the
-  expert can still add a true positive in regions the model didn't
-  see at all.
+- Behavior depends on what the probability map shows at the click:
+  1. If a connected component of voxels with p ≥ threshold (default
+     0.3, sticky per session) intersects the click, accept that whole
+     component as a new region of the model SEG segment — single
+     click, no painting. This is the fast path for the small slice
+     of cases where the model is "hesitant".
+  2. Otherwise (the empirically dominant case on NIH-style data: the
+     model gave p ≈ 0.003 in the missed region), drop into a small
+     sphere brush primed at the click location. The expert paints
+     the node by hand, but the Inferno overlay is still visible so
+     the borders of the GT outline guide them.
+- Why the dual mode: the MED_LYMPH_021 study showed only ~4 % of
+  missed voxels were above p ≥ 0.3, so the seed-grow path is the
+  exception, not the rule. The fallback paint with the GT outline as
+  a guide is what actually does the work on cases like these.
 
 ### "Remove a false positive" (Delete tool)
 
@@ -138,6 +163,18 @@ whole point: the corrections only matter if we can prove they help.
 | 7 | s | Train tab: "include expert-corrected reviews" checkbox |
 
 Total: ~1–2 weeks for one person.
+
+## Why these reviews matter for the next training round
+
+The MED_LYMPH_021 numbers above frame the value proposition: the model
+is *confidently wrong* on the regions it misses (p ≈ 0.003), not
+borderline. That makes these the strongest possible kind of hard
+negative — every corrected case directly contradicts a high-confidence
+prediction the model would have made on similar future cases. Adding
+them to the training set should push generalization much harder than
+another batch of in-distribution Tagwa cases would. The Train tab's
+"Include expert-corrected reviews" toggle is what lets us actually
+measure that with controlled A/B runs.
 
 ## Out of scope for v1
 
