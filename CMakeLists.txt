@@ -24,6 +24,7 @@ include(${Slicer_USE_FILE})
 #-----------------------------------------------------------------------------
 add_subdirectory(LNQStudio)
 add_subdirectory(LymphNodeQuantifier)
+add_subdirectory(LNQReview)
 
 #-----------------------------------------------------------------------------
 include(${Slicer_EXTENSION_GENERATE_CONFIG})
