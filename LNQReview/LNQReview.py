@@ -175,6 +175,8 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._prompts = None       # PromptToolController
         self._threshold = None     # ThresholdController
         self._shortcuts = []       # qt.QShortcut handles, kept alive
+        self._cohortSection = None # CohortListSection (table view)
+        self._perCaseWidgets = []  # widgets hidden until a case loads
 
     # ----- module entry / exit -----
 
@@ -202,23 +204,48 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
 
         # Lazily-imported tools controller (Slicer scene must exist).
         from LNQReviewLib.tools import PromptToolController, ThresholdController
+        from LNQReviewLib.cohort_list import CohortListSection
         self._prompts = PromptToolController()
         self._threshold = ThresholdController()
 
-        self.layout.addWidget(self._buildCaseHeader())
-        self.layout.addWidget(self._buildThresholdSection())
-        self.layout.addWidget(self._buildToolsSection())
-        self.layout.addWidget(self._buildNotesSection())
-        self.layout.addWidget(self._buildActionsSection())
-        self.layout.addWidget(self._buildScrubHintLabel())
-        self.layout.addWidget(self._buildDemoSection())
-        self.layout.addStretch(1)
+        # Cohort browser: the reviewer's landing surface. Spreadsheet of
+        # every case in the project; double-click loads.
+        self._cohortSection = CohortListSection()
+        self._cohortSection.caseActivated.connect(self._onCaseFromList)
+        cohortBox = qt.QGroupBox("Cohort")
+        cohortLay = qt.QVBoxLayout(cohortBox)
+        cohortLay.addWidget(self._cohortSection.widget)
+        self.layout.addWidget(cohortBox)
 
+        # Per-case widgets — hidden until a case is loaded; double-click
+        # in the cohort table switches them on.
+        for w in (
+            self._buildCaseHeader(),
+            self._buildThresholdSection(),
+            self._buildToolsSection(),
+            self._buildNotesSection(),
+            self._buildActionsSection(),
+            self._buildScrubHintLabel(),
+        ):
+            self.layout.addWidget(w)
+            self._perCaseWidgets.append(w)
+        self._setPerCaseVisible(False)
+
+        self.layout.addStretch(1)
         self._refreshButtonStates()
 
     def _buildCaseHeader(self):
         box = qt.QGroupBox("Case")
         v = qt.QVBoxLayout(box)
+
+        # Back-to-list affordance — the cohort browser is "home."
+        self._backToListButton = qt.QPushButton("← Back to cohort list")
+        self._backToListButton.setStyleSheet(
+            "text-align: left; padding: 4px; color: #246;")
+        self._backToListButton.setFlat(True)
+        self._backToListButton.connect("clicked()", self._onBackToList)
+        v.addWidget(self._backToListButton)
+
         self._caseProgressLabel = qt.QLabel("(no case loaded)")
         self._caseProgressLabel.setStyleSheet("font-weight: bold;")
         self._patientLabel = qt.QLabel("")
@@ -338,19 +365,8 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         label.setAlignment(qt.Qt.AlignHCenter)
         return label
 
-    def _buildDemoSection(self):
-        # Wiring-only affordance; will be replaced by the chronicle-driven
-        # queue navigation later.
-        box = qt.QGroupBox("Demo / dev")
-        v = qt.QVBoxLayout(box)
-        self._demoButton = qt.QPushButton("Load demo (MED_LYMPH_001)")
-        self._demoButton.setToolTip(
-            "Loads the smoke-tested IDC mediastinal case from Manila so "
-            "the review experience is testable end-to-end before the "
-            "chronicle queue plumbing lands.")
-        self._demoButton.connect("clicked()", self._onLoadDemo)
-        v.addWidget(self._demoButton)
-        return box
+    # _buildDemoSection removed — the cohort table is the entry point now;
+    # double-click on a row loads the case end-to-end.
 
     # ----- keyboard shortcuts -----
 
@@ -466,36 +482,81 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
                 step = bg.GetSpacing()[2]
         sliceLogic.SetSliceOffset(offset + direction * step)
 
-    # ----- demo load -----
+    # ----- view switching -----
 
-    def _onLoadDemo(self):
-        paths = self.logic.demoCasePaths()
-        missing = [k for k, p in paths.items() if not p or not os.path.isfile(p)]
+    def _setPerCaseVisible(self, visible):
+        """Toggle the per-case tool surface on/off as a unit so the
+        landing experience is just the cohort table."""
+        for w in self._perCaseWidgets:
+            w.setVisible(visible)
+
+    def _setCohortVisible(self, visible):
+        # Walk up to the parent QGroupBox so the table + its surrounding
+        # labels all collapse together.
+        if self._cohortSection is None:
+            return
+        host = self._cohortSection.widget
+        while host is not None and not isinstance(host, qt.QGroupBox):
+            host = host.parent() if hasattr(host, "parent") else None
+        if host is not None:
+            host.setVisible(visible)
+
+    def _onBackToList(self):
+        self._setPerCaseVisible(False)
+        self._setCohortVisible(True)
+        # Clear the prompts so they don't pollute the next case.
+        if self._prompts is not None:
+            self._prompts.clearAll()
+        # The CT + segmentations stay in the scene; if the reviewer picks
+        # the same row they'll be re-loaded via the same paths.
+
+    # ----- load case driven by the cohort table -----
+
+    def _onCaseFromList(self, case_id):
+        """The cohort table double-clicked a row. Resolve its paths
+        from the same directory convention and load."""
+        from LNQReviewLib.cohort_list import derive_case_paths
+        paths = derive_case_paths(self._cohortSection.dataRoot,
+                                   self._cohortSection.modelName,
+                                   case_id)
+        missing = [k for k in ("ct", "model_seg", "model_prob")
+                    if paths.get(k) is None]
         if missing:
             slicer.util.errorDisplay(
-                "Demo case files not found locally:\n  "
-                + "\n  ".join(f"{k}: {paths[k]}" for k in missing)
-                + "\n\nRun the ingest-idc-cohort.py smoke test first (or "
-                  "point the script at a different Manila mount).")
+                f"Case {case_id} is missing required files: "
+                + ", ".join(missing)
+                + f"\n\nLooked under {self._cohortSection.dataRoot}/ with the "
+                  f"ingest-idc-cohort.py directory convention.")
             return
+
         for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
             slicer.mrmlScene.RemoveNode(n)
         for n in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
             slicer.mrmlScene.RemoveNode(n)
-        self._prompts.clearAll()
+        if self._prompts is not None:
+            self._prompts.clearAll()
 
-        self._sceneNodes = self.logic.loadCase(paths)
+        # Reuse the existing loader — same node names, same colors, same
+        # overlay wiring.
+        load_paths = {"ct": paths["ct"], "gt": paths["gt"],
+                       "model_seg": paths["model_seg"],
+                       "model_prob": paths["model_prob"]}
+        self._sceneNodes = self.logic.loadCase(load_paths)
         self.logic.setupSliceViewOverlay(
             self._sceneNodes["ct"], self._sceneNodes["model_prob"],
             [self._sceneNodes["gt"], self._sceneNodes["model_seg"]])
-
         if self._sceneNodes["model_prob"]:
             self._threshold.setProbabilityVolume(self._sceneNodes["model_prob"])
 
-        self._caseProgressLabel.setText("Case 1 of 1 (demo)")
-        self._patientLabel.setText("Patient: MED_LYMPH_001")
-        self._anatomyLabel.setText("Anatomy: mediastinal")
-        self._actionStatusLabel.setText("Demo case loaded.")
+        self._caseProgressLabel.setText(case_id)
+        self._patientLabel.setText(f"Patient: {case_id}")
+        self._anatomyLabel.setText(f"Anatomy: {self._cohortSection.modelName}")
+        self._actionStatusLabel.setText(
+            "Loaded. Use j/k to scrub slices, threshold slider to tune, "
+            "1/2 to drop positive/negative prompts.")
+
+        self._setCohortVisible(False)
+        self._setPerCaseVisible(True)
 
     # ----- case exit actions (stubbed for this iteration) -----
 

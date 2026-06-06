@@ -7,6 +7,7 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}Lib/__init__.py
   ${MODULE_NAME}Lib/layout.py
   ${MODULE_NAME}Lib/tools.py
+  ${MODULE_NAME}Lib/cohort_list.py
   )
 
 set(MODULE_PYTHON_RESOURCES
