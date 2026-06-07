@@ -355,8 +355,10 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         presetRow.addWidget(self._ctPresetCombo, 1)
         v.addLayout(presetRow)
 
-        # Visibility toggles for the two reference layers. The model
-        # SEG stays on because that's what the reviewer is correcting.
+        # Visibility toggles for the three layered renderings. Each button
+        # is checkable; checked == "currently hidden". The reviewer uses
+        # them to isolate one layer at a time when comparing the model
+        # prediction against the GT or the raw CT.
         toggleRow = qt.QHBoxLayout()
         self._gtVisibleButton = qt.QPushButton("Hide GT outline")
         self._gtVisibleButton.setCheckable(True)
@@ -365,6 +367,15 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
             "Toggle the NIH ground-truth outline. Press to compare the "
             "model SEG without the reference visually anchoring you.")
         self._gtVisibleButton.connect("clicked()", self._onToggleGTVisibility)
+        self._modelVisibleButton = qt.QPushButton("Hide LNQ prediction")
+        self._modelVisibleButton.setCheckable(True)
+        self._modelVisibleButton.setChecked(False)
+        self._modelVisibleButton.setToolTip(
+            "Toggle the LNQ model SEG (thresholded). Hides both fill and "
+            "outline so you can read the CT + GT or the probability heatmap "
+            "without the prediction overlapping them.")
+        self._modelVisibleButton.connect(
+            "clicked()", self._onToggleModelVisibility)
         self._overlayVisibleButton = qt.QPushButton("Hide probability overlay")
         self._overlayVisibleButton.setCheckable(True)
         self._overlayVisibleButton.setChecked(False)
@@ -374,6 +385,7 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._overlayVisibleButton.connect(
             "clicked()", self._onToggleOverlayVisibility)
         toggleRow.addWidget(self._gtVisibleButton)
+        toggleRow.addWidget(self._modelVisibleButton)
         toggleRow.addWidget(self._overlayVisibleButton)
         v.addLayout(toggleRow)
         return box
@@ -602,6 +614,18 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._gtVisibleButton.setText(
             "Show GT outline" if hide else "Hide GT outline")
 
+    def _onToggleModelVisibility(self):
+        seg = self._sceneNodes.get("model_seg") if self._sceneNodes else None
+        if seg is None:
+            return
+        disp = seg.GetDisplayNode()
+        if disp is None:
+            return
+        hide = self._modelVisibleButton.isChecked()
+        disp.SetVisibility(not hide)
+        self._modelVisibleButton.setText(
+            "Show LNQ prediction" if hide else "Hide LNQ prediction")
+
     def _onToggleOverlayVisibility(self):
         prob = self._sceneNodes.get("model_prob") if self._sceneNodes else None
         if prob is None:
@@ -702,6 +726,9 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         if hasattr(self, "_gtVisibleButton"):
             self._gtVisibleButton.setChecked(False)
             self._gtVisibleButton.setText("Hide GT outline")
+        if hasattr(self, "_modelVisibleButton"):
+            self._modelVisibleButton.setChecked(False)
+            self._modelVisibleButton.setText("Hide LNQ prediction")
         if hasattr(self, "_overlayVisibleButton"):
             self._overlayVisibleButton.setChecked(False)
             self._overlayVisibleButton.setText("Hide probability overlay")
