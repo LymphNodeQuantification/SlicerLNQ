@@ -42,6 +42,23 @@ from slicer.ScriptedLoadableModule import (
 )
 
 
+# CT window/level presets (Hounsfield units), ordered by clinical frequency
+# for our use case. (label, window, level)
+CT_PRESETS = [
+    ("Default (auto)",  None, None),
+    ("CT-Abdomen",      350,   40),
+    ("CT-Mediastinum",  350,   50),
+    ("CT-Chest",        400,   40),
+    ("CT-Lung",         1500, -600),
+    ("CT-Bone",         1500,  300),
+]
+
+# Threshold-preset buttons next to the log-scaled slider; values chosen to
+# span the empirically interesting range (1e-3 is the calibrated cutoff,
+# 0.3 the conservative bump, 0.5 the argmax).
+THRESHOLD_PRESETS = [0.001, 0.01, 0.1, 0.3, 0.5]
+
+
 # =============================================================================
 # Module
 # =============================================================================
@@ -104,10 +121,17 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
                     sid = seg.GetNthSegmentID(0)
                     s = seg.GetSegment(sid)
                     s.SetName("Ground truth")
-                    s.SetColor(1.0, 0.2, 0.2)
+                    # Pure bright red so the outline reads against the
+                    # darker CT background of mediastinal scans.
+                    s.SetColor(1.0, 0.0, 0.0)
                 disp = out["gt"].GetDisplayNode()
                 if disp is not None:
-                    disp.SetVisibility2DFill(False)
+                    # Outline-only for the GT so it doesn't obscure the
+                    # model SEG that sits underneath. Touch of fill at
+                    # very low alpha gives the outline a more saturated
+                    # halo without making it look like a separate region.
+                    disp.SetVisibility2DFill(True)
+                    disp.SetOpacity2DFill(0.15)
                     disp.SetVisibility2DOutline(True)
                     disp.SetOpacity2DOutline(1.0)
         if paths.get("model_seg") and os.path.isfile(paths["model_seg"]):
@@ -181,22 +205,30 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._currentCohortRoot = ""
         self._currentCohortModel = ""
         self._currentCaseId = ""
+        self._lastAutoThreshold = None       # remembered for the Reset button
 
     # ----- module entry / exit -----
 
+    # While we're iterating on the review experience, keep Slicer's normal
+    # chrome (toolbars, 3D view, data probe, console) visible. Flip this
+    # to True before going to production so reviewers get the focused
+    # single-slice layout the deployment spec calls for.
+    HIDE_CHROME_ON_ENTER = False
+
     def enter(self):
         """Slicer calls enter() each time the user switches into this
-        module. We hide chrome here (capturing a restore-point on the
-        widget) and switch to the single-slice layout."""
-        from LNQReviewLib import layout
-        if self._chromeState is None:
-            self._chromeState = layout.hideChrome()
+        module. With HIDE_CHROME_ON_ENTER=True we capture a restore
+        point + collapse to the single-slice layout."""
+        if self.HIDE_CHROME_ON_ENTER:
+            from LNQReviewLib import layout
+            if self._chromeState is None:
+                self._chromeState = layout.hideChrome()
         self._installShortcuts()
 
     def exit(self):
         """Restore the user's normal Slicer chrome on the way out."""
-        from LNQReviewLib import layout
         if self._chromeState is not None:
+            from LNQReviewLib import layout
             layout.restoreChrome(self._chromeState)
             self._chromeState = None
         self._uninstallShortcuts()
@@ -215,6 +247,7 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         # LNQ Worklist's Inference Review tab via loadFromCohort().
         self.layout.addWidget(self._buildCaseHeader())
         self.layout.addWidget(self._buildThresholdSection())
+        self.layout.addWidget(self._buildDisplaySection())
         self.layout.addWidget(self._buildToolsSection())
         self.layout.addWidget(self._buildNotesSection())
         self.layout.addWidget(self._buildActionsSection())
@@ -222,6 +255,7 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
 
         self.layout.addStretch(1)
         self._refreshButtonStates()
+        self._refreshAutoResetButton()
 
     def _buildCaseHeader(self):
         box = qt.QGroupBox("Case")
@@ -271,6 +305,77 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
             "positive and negative prompt points by balanced accuracy.")
         self._autoThresholdButton.connect("clicked()", self._onAutoThreshold)
         v.addWidget(self._autoThresholdButton)
+
+        self._resetAutoButton = qt.QPushButton("Reset to auto")
+        self._resetAutoButton.setToolTip(
+            "Snap the slider back to the threshold the last Auto-from-prompts "
+            "sweep picked. Useful after eyeballing a few manual values.")
+        self._resetAutoButton.setEnabled(False)
+        self._resetAutoButton.connect("clicked()", self._onResetAutoThreshold)
+        v.addWidget(self._resetAutoButton)
+
+        # Quick-jump preset row. Each button snaps the log-scaled slider
+        # to a frequently-useful value; 0.3 is the conservative bump
+        # cited in the deploy-tab spec and 0.5 mirrors the argmax cutoff.
+        presetRow = qt.QHBoxLayout()
+        presetRow.addWidget(qt.QLabel("Presets:"))
+        self._thresholdPresetButtons = []
+        for p in THRESHOLD_PRESETS:
+            btn = qt.QPushButton(f"{p:g}")
+            btn.setMaximumWidth(54)
+            btn.setToolTip(f"Snap threshold to p ≥ {p}")
+            btn.connect("clicked()",
+                        lambda p=p: self._setThresholdValue(p, source="preset"))
+            presetRow.addWidget(btn)
+            self._thresholdPresetButtons.append(btn)
+        presetRow.addStretch(1)
+        v.addLayout(presetRow)
+        return box
+
+    def _buildDisplaySection(self):
+        """Per-case display controls: CT window/level preset + overlay /
+        GT-curve visibility toggles. Lives between Threshold (which
+        drives the heatmap) and Tools (which drive segmentation
+        edits) so the reviewer's display knobs are colocated."""
+        box = qt.QGroupBox("Display")
+        v = qt.QVBoxLayout(box)
+
+        # CT preset dropdown. Default keeps the loader's auto W/L.
+        presetRow = qt.QHBoxLayout()
+        presetRow.addWidget(qt.QLabel("CT preset:"))
+        self._ctPresetCombo = qt.QComboBox()
+        for label, _w, _l in CT_PRESETS:
+            self._ctPresetCombo.addItem(label)
+        # Land on CT-Abdomen by default per reviewer preference.
+        defaultIndex = next((i for i, p in enumerate(CT_PRESETS)
+                              if p[0] == "CT-Abdomen"), 0)
+        self._ctPresetCombo.setCurrentIndex(defaultIndex)
+        self._ctPresetCombo.connect("currentIndexChanged(int)",
+                                     self._onCTPresetChanged)
+        presetRow.addWidget(self._ctPresetCombo, 1)
+        v.addLayout(presetRow)
+
+        # Visibility toggles for the two reference layers. The model
+        # SEG stays on because that's what the reviewer is correcting.
+        toggleRow = qt.QHBoxLayout()
+        self._gtVisibleButton = qt.QPushButton("Hide GT outline")
+        self._gtVisibleButton.setCheckable(True)
+        self._gtVisibleButton.setChecked(False)
+        self._gtVisibleButton.setToolTip(
+            "Toggle the NIH ground-truth outline. Press to compare the "
+            "model SEG without the reference visually anchoring you.")
+        self._gtVisibleButton.connect("clicked()", self._onToggleGTVisibility)
+        self._overlayVisibleButton = qt.QPushButton("Hide probability overlay")
+        self._overlayVisibleButton.setCheckable(True)
+        self._overlayVisibleButton.setChecked(False)
+        self._overlayVisibleButton.setToolTip(
+            "Toggle the Inferno probability heatmap. Hides the foreground "
+            "layer so you see just the CT + segmentations.")
+        self._overlayVisibleButton.connect(
+            "clicked()", self._onToggleOverlayVisibility)
+        toggleRow.addWidget(self._gtVisibleButton)
+        toggleRow.addWidget(self._overlayVisibleButton)
+        v.addLayout(toggleRow)
         return box
 
     def _buildToolsSection(self):
@@ -412,11 +517,23 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         threshold = ThresholdController.sliderToThreshold(value)
         self._threshold.setThreshold(threshold)
         self._thresholdValueLabel.setText(f"p ≥ {threshold:.4g}")
+        self._refreshAutoResetButton()
 
     def _stepThreshold(self, direction):
         step = max(1, self._threshold.SLIDER_TICKS // 100)
         self._thresholdSlider.setValue(
             self._thresholdSlider.value + direction * step)
+
+    def _setThresholdValue(self, threshold, source="manual"):
+        """Programmatic slider snap (preset buttons, Reset-to-auto).
+        Mirrors what dragging the slider would do but skips the
+        auto-resetbutton refresh that the dragged path triggers."""
+        from LNQReviewLib.tools import ThresholdController
+        self._thresholdSlider.setValue(
+            ThresholdController.thresholdToSlider(threshold))
+        if source == "preset":
+            self._actionStatusLabel.setText(
+                f"Threshold preset → p ≥ {threshold:g}")
 
     def _onAutoThreshold(self):
         threshold, diagnostics = self._threshold.tuneToPrompts(
@@ -424,12 +541,81 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         from LNQReviewLib.tools import ThresholdController
         self._thresholdSlider.setValue(
             ThresholdController.thresholdToSlider(threshold))
+        self._lastAutoThreshold = threshold
         note = diagnostics.get("note") or ""
         self._actionStatusLabel.setText(
             f"Auto threshold → p ≥ {threshold:.4g} "
             f"(pos={diagnostics['positives']}, neg={diagnostics['negatives']}"
             + (f", balanced acc={diagnostics['objective']}" if diagnostics.get("objective") else "")
             + (f"; {note}" if note else "") + ")")
+        self._refreshAutoResetButton()
+
+    def _onResetAutoThreshold(self):
+        if self._lastAutoThreshold is None:
+            return
+        self._setThresholdValue(self._lastAutoThreshold)
+        self._actionStatusLabel.setText(
+            f"Snap to last auto threshold → p ≥ {self._lastAutoThreshold:.4g}")
+
+    def _refreshAutoResetButton(self):
+        if not hasattr(self, "_resetAutoButton"):
+            return
+        self._resetAutoButton.setEnabled(self._lastAutoThreshold is not None)
+        if self._lastAutoThreshold is not None:
+            self._resetAutoButton.setText(
+                f"Reset to auto (p ≥ {self._lastAutoThreshold:.4g})")
+        else:
+            self._resetAutoButton.setText("Reset to auto")
+
+    # ----- display knobs -----
+
+    def _onCTPresetChanged(self, idx):
+        if idx < 0 or idx >= len(CT_PRESETS):
+            return
+        label, window, level = CT_PRESETS[idx]
+        ct = self._sceneNodes.get("ct") if self._sceneNodes else None
+        if ct is None:
+            return
+        disp = ct.GetDisplayNode()
+        if disp is None:
+            return
+        if window is None or level is None:
+            # Restore auto W/L (the loader's default).
+            disp.SetAutoWindowLevel(True)
+        else:
+            disp.SetAutoWindowLevel(False)
+            disp.SetWindowLevel(window, level)
+        self._actionStatusLabel.setText(
+            f"CT W/L preset → {label}"
+            + (f" (W={window}, L={level})" if window is not None else ""))
+
+    def _onToggleGTVisibility(self):
+        gt = self._sceneNodes.get("gt") if self._sceneNodes else None
+        if gt is None:
+            return
+        disp = gt.GetDisplayNode()
+        if disp is None:
+            return
+        # Button is checkable: checked == "hidden".
+        hide = self._gtVisibleButton.isChecked()
+        disp.SetVisibility(not hide)
+        self._gtVisibleButton.setText(
+            "Show GT outline" if hide else "Hide GT outline")
+
+    def _onToggleOverlayVisibility(self):
+        prob = self._sceneNodes.get("model_prob") if self._sceneNodes else None
+        if prob is None:
+            return
+        # Foreground volume in every slice viewer. Setting opacity to 0
+        # is the standard way to suppress the foreground layer without
+        # tearing it down.
+        hide = self._overlayVisibleButton.isChecked()
+        opacity = 0.0 if hide else 0.55
+        for c in slicer.app.layoutManager().sliceViewNames():
+            cn = slicer.app.layoutManager().sliceWidget(c).sliceLogic().GetSliceCompositeNode()
+            cn.SetForegroundOpacity(opacity)
+        self._overlayVisibleButton.setText(
+            "Show probability overlay" if hide else "Hide probability overlay")
 
     # ----- prompt tools -----
 
@@ -506,6 +692,20 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
             [self._sceneNodes["gt"], self._sceneNodes["model_seg"]])
         if self._sceneNodes["model_prob"]:
             self._threshold.setProbabilityVolume(self._sceneNodes["model_prob"])
+
+        # Apply whatever CT preset the dropdown is currently set to.
+        if hasattr(self, "_ctPresetCombo"):
+            self._onCTPresetChanged(self._ctPresetCombo.currentIndex)
+
+        # Reset per-case state.
+        self._lastAutoThreshold = None
+        if hasattr(self, "_gtVisibleButton"):
+            self._gtVisibleButton.setChecked(False)
+            self._gtVisibleButton.setText("Hide GT outline")
+        if hasattr(self, "_overlayVisibleButton"):
+            self._overlayVisibleButton.setChecked(False)
+            self._overlayVisibleButton.setText("Hide probability overlay")
+        self._refreshAutoResetButton()
 
         self._currentCohortRoot = data_root
         self._currentCohortModel = model_name
