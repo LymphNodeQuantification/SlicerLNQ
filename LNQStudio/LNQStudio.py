@@ -1447,11 +1447,56 @@ class WorklistWindow(qt.QWidget):
             self._tables[role] = table
             self._roleTabs.addTab(page, title)
 
+        # ---- Inference Review tab ----
+        # Driven by idc-batch-qc.py's qc.csv (not chronicle Annotations).
+        # Each row is one case in an IDC-ingested cohort with the model's
+        # SEG + probability volume pre-computed. Double-click activates
+        # LNQReview module + loads the four NRRDs.
+        self._inferenceCohortSection = None
+        try:
+            from LNQReviewLib.cohort_list import CohortListSection
+            inferencePage = qt.QWidget()
+            inferenceLayout = qt.QVBoxLayout(inferencePage)
+            self._inferenceCohortSection = CohortListSection()
+            self._inferenceCohortSection.caseActivated.connect(
+                self._onInferenceCaseActivated)
+            inferenceLayout.addWidget(self._inferenceCohortSection.widget)
+            self._roleTabs.addTab(inferencePage, "Inference Review")
+        except Exception as exc:
+            logging.warning(
+                "LNQ Worklist: Inference Review tab unavailable (%s). "
+                "Ensure the LNQReview module is on the Slicer module path.",
+                exc)
+
         # Restore prior geometry (size + position, including which screen) if
         # we've been shown before. Falls back to a sensible default size, but
         # *no explicit position* so the window manager can place it.
         if not self._restoreGeometry():
             self.resize(900, 600)
+
+    # ----- inference-review bridge -----
+
+    def _onInferenceCaseActivated(self, case_id):
+        """Cohort table row double-clicked. Switch to LNQReview module
+        and hand it the case to load."""
+        if self._inferenceCohortSection is None:
+            return
+        data_root = self._inferenceCohortSection.dataRoot
+        model = self._inferenceCohortSection.modelName
+        try:
+            slicer.util.selectModule("LNQReview")
+            review_widget = slicer.modules.lnqreview.widgetRepresentation().self()
+            if hasattr(review_widget, "loadFromCohort"):
+                review_widget.loadFromCohort(data_root, model, case_id)
+            else:
+                slicer.util.errorDisplay(
+                    "LNQReview module is registered but doesn't expose "
+                    "loadFromCohort() — check the SlicerLNQ install.")
+        except Exception as exc:
+            logging.exception("Inference Review activation failed")
+            slicer.util.errorDisplay(
+                f"Could not switch to LNQReview module: {exc}\n\n"
+                f"Make sure LNQReview is on the Slicer module path.")
 
     def _restoreGeometry(self):
         geom = qt.QSettings().value(self._GEOMETRY_KEY)

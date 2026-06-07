@@ -175,8 +175,12 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._prompts = None       # PromptToolController
         self._threshold = None     # ThresholdController
         self._shortcuts = []       # qt.QShortcut handles, kept alive
-        self._cohortSection = None # CohortListSection (table view)
-        self._perCaseWidgets = []  # widgets hidden until a case loads
+        # Cohort browsing lives in the LNQ Worklist (see LNQStudio
+        # WorklistWindow → "Inference Review" tab). This module is the
+        # focused single-case interface that the worklist activates.
+        self._currentCohortRoot = ""
+        self._currentCohortModel = ""
+        self._currentCaseId = ""
 
     # ----- module entry / exit -----
 
@@ -204,32 +208,17 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
 
         # Lazily-imported tools controller (Slicer scene must exist).
         from LNQReviewLib.tools import PromptToolController, ThresholdController
-        from LNQReviewLib.cohort_list import CohortListSection
         self._prompts = PromptToolController()
         self._threshold = ThresholdController()
 
-        # Cohort browser: the reviewer's landing surface. Spreadsheet of
-        # every case in the project; double-click loads.
-        self._cohortSection = CohortListSection()
-        self._cohortSection.caseActivated.connect(self._onCaseFromList)
-        cohortBox = qt.QGroupBox("Cohort")
-        cohortLay = qt.QVBoxLayout(cohortBox)
-        cohortLay.addWidget(self._cohortSection.widget)
-        self.layout.addWidget(cohortBox)
-
-        # Per-case widgets — hidden until a case is loaded; double-click
-        # in the cohort table switches them on.
-        for w in (
-            self._buildCaseHeader(),
-            self._buildThresholdSection(),
-            self._buildToolsSection(),
-            self._buildNotesSection(),
-            self._buildActionsSection(),
-            self._buildScrubHintLabel(),
-        ):
-            self.layout.addWidget(w)
-            self._perCaseWidgets.append(w)
-        self._setPerCaseVisible(False)
+        # Single-case tool surface. The reviewer arrives here from the
+        # LNQ Worklist's Inference Review tab via loadFromCohort().
+        self.layout.addWidget(self._buildCaseHeader())
+        self.layout.addWidget(self._buildThresholdSection())
+        self.layout.addWidget(self._buildToolsSection())
+        self.layout.addWidget(self._buildNotesSection())
+        self.layout.addWidget(self._buildActionsSection())
+        self.layout.addWidget(self._buildScrubHintLabel())
 
         self.layout.addStretch(1)
         self._refreshButtonStates()
@@ -482,50 +471,22 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
                 step = bg.GetSpacing()[2]
         sliceLogic.SetSliceOffset(offset + direction * step)
 
-    # ----- view switching -----
+    # ----- public API called from the LNQ Worklist's Inference Review tab -----
 
-    def _setPerCaseVisible(self, visible):
-        """Toggle the per-case tool surface on/off as a unit so the
-        landing experience is just the cohort table."""
-        for w in self._perCaseWidgets:
-            w.setVisible(visible)
-
-    def _setCohortVisible(self, visible):
-        # Walk up to the parent QGroupBox so the table + its surrounding
-        # labels all collapse together.
-        if self._cohortSection is None:
-            return
-        host = self._cohortSection.widget
-        while host is not None and not isinstance(host, qt.QGroupBox):
-            host = host.parent() if hasattr(host, "parent") else None
-        if host is not None:
-            host.setVisible(visible)
-
-    def _onBackToList(self):
-        self._setPerCaseVisible(False)
-        self._setCohortVisible(True)
-        # Clear the prompts so they don't pollute the next case.
-        if self._prompts is not None:
-            self._prompts.clearAll()
-        # The CT + segmentations stay in the scene; if the reviewer picks
-        # the same row they'll be re-loaded via the same paths.
-
-    # ----- load case driven by the cohort table -----
-
-    def _onCaseFromList(self, case_id):
-        """The cohort table double-clicked a row. Resolve its paths
-        from the same directory convention and load."""
+    def loadFromCohort(self, data_root, model_name, case_id):
+        """Load the case identified by `case_id` from the standard
+        ingest-idc-cohort.py + idc-batch-qc.py directory layout under
+        `data_root`. This is the entry point the worklist's
+        Inference Review tab calls on row double-click."""
         from LNQReviewLib.cohort_list import derive_case_paths
-        paths = derive_case_paths(self._cohortSection.dataRoot,
-                                   self._cohortSection.modelName,
-                                   case_id)
+        paths = derive_case_paths(data_root, model_name, case_id)
         missing = [k for k in ("ct", "model_seg", "model_prob")
                     if paths.get(k) is None]
         if missing:
             slicer.util.errorDisplay(
                 f"Case {case_id} is missing required files: "
                 + ", ".join(missing)
-                + f"\n\nLooked under {self._cohortSection.dataRoot}/ with the "
+                + f"\n\nLooked under {data_root}/ with the "
                   f"ingest-idc-cohort.py directory convention.")
             return
 
@@ -536,8 +497,6 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         if self._prompts is not None:
             self._prompts.clearAll()
 
-        # Reuse the existing loader — same node names, same colors, same
-        # overlay wiring.
         load_paths = {"ct": paths["ct"], "gt": paths["gt"],
                        "model_seg": paths["model_seg"],
                        "model_prob": paths["model_prob"]}
@@ -548,15 +507,34 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         if self._sceneNodes["model_prob"]:
             self._threshold.setProbabilityVolume(self._sceneNodes["model_prob"])
 
+        self._currentCohortRoot = data_root
+        self._currentCohortModel = model_name
+        self._currentCaseId = case_id
         self._caseProgressLabel.setText(case_id)
         self._patientLabel.setText(f"Patient: {case_id}")
-        self._anatomyLabel.setText(f"Anatomy: {self._cohortSection.modelName}")
+        self._anatomyLabel.setText(f"Anatomy: {model_name}")
         self._actionStatusLabel.setText(
             "Loaded. Use j/k to scrub slices, threshold slider to tune, "
             "1/2 to drop positive/negative prompts.")
 
-        self._setCohortVisible(False)
-        self._setPerCaseVisible(True)
+    # ----- view switching -----
+
+    def _onBackToList(self):
+        """Send the reviewer back to the worklist so they can pick the
+        next case. We don't kill the scene — if the reviewer picks the
+        same row again it just re-loads, which is fine; if they pick a
+        different one, loadFromCohort() clears the scene first."""
+        if self._prompts is not None:
+            self._prompts.clearAll()
+        # Bring the worklist back forward — it's an independent top-level
+        # window so it survives module switches.
+        try:
+            ls = slicer.modules.lnqstudio.widgetRepresentation().self()
+            if hasattr(ls, "setWorklistVisible"):
+                ls.setWorklistVisible(True)
+        except Exception:
+            pass
+        slicer.util.selectModule("LNQStudio")
 
     # ----- case exit actions (stubbed for this iteration) -----
 
