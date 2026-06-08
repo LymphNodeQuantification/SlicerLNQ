@@ -58,6 +58,16 @@ CT_PRESETS = [
 # 0.3 the conservative bump, 0.5 the argmax).
 THRESHOLD_PRESETS = [0.001, 0.01, 0.1, 0.3, 0.5]
 
+# Anatomy palette for the extra (non-primary) model SEGs that get loaded
+# alongside the case. Values mirror lnq-segmenter/_registry.json so the
+# slice + 3D color is consistent with the model card. Anything not listed
+# falls back to gray.
+EXTRA_ANATOMY_COLORS = {
+    "abdominopelvic-v1": (120 / 255, 220 / 255, 120 / 255),  # green
+    "axillary-v1":       (255 / 255, 150 / 255, 100 / 255),  # orange
+    "inguinal-v1":       (240 / 255, 220 / 255,  60 / 255),  # yellow-gold
+}
+
 
 # =============================================================================
 # Module
@@ -163,6 +173,41 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
             if out["model_prob"] is not None:
                 out["model_prob"].SetName("LNQReview:probability")
         return out
+
+    @staticmethod
+    def loadExtraAnatomySegmentation(model_name, seg_path):
+        """Load one non-primary model's SEG NRRD and dress it so it reads
+        as a distinct anatomy in the slice + 3D views. Colors come from
+        EXTRA_ANATOMY_COLORS, falling back to gray if a new model is
+        introduced without a palette entry."""
+        if not seg_path or not os.path.isfile(seg_path):
+            return None
+        node = slicer.util.loadSegmentation(seg_path)
+        if node is None:
+            return None
+        node.SetName(f"LNQReview:{model_name}")
+        color = EXTRA_ANATOMY_COLORS.get(model_name, (0.6, 0.6, 0.6))
+        seg = node.GetSegmentation()
+        if seg.GetNumberOfSegments():
+            sid = seg.GetNthSegmentID(0)
+            s = seg.GetSegment(sid)
+            s.SetName(model_name)
+            s.SetColor(*color)
+        disp = node.GetDisplayNode()
+        if disp is not None:
+            # Same dressing as the primary model SEG: faint fill + crisp
+            # outline in 2D, 1/3 opacity in 3D so the layered anatomies
+            # stay legible together. Visibility is on by default; the
+            # extras follow the LNQ-prediction toggle (which currently
+            # flips just the primary model — extras need their own
+            # widget toggles in a follow-up if reviewers want
+            # per-anatomy isolation).
+            disp.SetVisibility2DFill(True)
+            disp.SetOpacity2DFill(0.30)
+            disp.SetVisibility2DOutline(True)
+            disp.SetVisibility3D(True)
+            disp.SetOpacity3D(0.33)
+        return node
 
     @staticmethod
     def setupSliceViewOverlay(ct_node, prob_node, segmentation_nodes):
@@ -513,6 +558,7 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._currentCaseId = ""
         self._lastAutoThreshold = None       # remembered for the Reset button
         self._probVRDisplayNode = None       # vtkMRMLVolumeRenderingDisplayNode
+        self._extraAnatomyNodes = {}         # {model_name: vtkMRMLSegmentationNode}
 
     # ----- module entry / exit -----
 
@@ -1038,26 +1084,38 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
                        "model_seg": paths["model_seg"],
                        "model_prob": paths["model_prob"]}
         self._sceneNodes = self.logic.loadCase(load_paths)
+        # Load every additional anatomy that has a SEG on disk so the
+        # reviewer sees abdominopelvic / axillary / inguinal candidates
+        # at the same time as the primary mediastinal layers. Each is
+        # painted in a distinct color (EXTRA_ANATOMY_COLORS).
+        self._extraAnatomyNodes = {}
+        for extra in paths.get("extra_anatomies", []):
+            node = self.logic.loadExtraAnatomySegmentation(
+                extra["name"], extra["seg_path"])
+            if node is not None:
+                self._extraAnatomyNodes[extra["name"]] = node
+        all_seg_nodes = [self._sceneNodes["gt"], self._sceneNodes["model_seg"]]
+        all_seg_nodes += list(self._extraAnatomyNodes.values())
         self.logic.setupSliceViewOverlay(
             self._sceneNodes["ct"], self._sceneNodes["model_prob"],
-            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]])
+            all_seg_nodes)
         if self._sceneNodes["model_prob"]:
             self._threshold.setProbabilityVolume(self._sceneNodes["model_prob"])
 
-        # 3D pipeline: closed-surface meshes for the segmentations + a
-        # spike-opacity volume rendering of the probability map. The VR
-        # is recomputed each time the threshold slider moves so the 3D
-        # iso-band tracks what the slice views are showing.
-        self.logic.buildClosedSurfaces(
-            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]])
+        # 3D pipeline: closed-surface meshes for every segmentation + a
+        # spike-opacity volume rendering of the primary probability map.
+        # The VR is recomputed each time the threshold slider moves so
+        # the 3D iso-band tracks what the slice views are showing. Only
+        # the primary model gets a probability VR — the extras stay as
+        # closed-surface meshes since stacking 4 VR display nodes would
+        # both cost frame rate and read as visual mush.
+        self.logic.buildClosedSurfaces(all_seg_nodes)
         self._probVRDisplayNode = self.logic.setupProbabilityVolumeRendering(
             self._sceneNodes["model_prob"], self._threshold.threshold)
         center = self.logic.segmentationsCenter(
-            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]],
-            self._sceneNodes["ct"])
+            all_seg_nodes, self._sceneNodes["ct"])
         extent = self.logic.segmentationsExtent(
-            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]],
-            self._sceneNodes["ct"])
+            all_seg_nodes, self._sceneNodes["ct"])
         if center is not None:
             self.logic.jumpSlicesToRAS(center)
             if extent is not None:

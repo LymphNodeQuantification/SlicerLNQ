@@ -63,17 +63,41 @@ def discover_qc_csv(data_root, model_name):
 
 def derive_case_paths(data_root, model_name, case_id):
     """Apply the standard directory convention to find this case's
-    four-NRRD set + tooltip PNG. Missing files are returned as None
-    so the caller can warn rather than crash."""
+    four-NRRD set + tooltip PNG plus any *additional* per-anatomy
+    predictions sitting under predictions/<other-model>/. Missing files
+    are returned as None so the caller can warn rather than crash.
+
+    `extra_anatomies` is the list of non-primary models that have a SEG
+    on disk for this case — each entry is
+        {"name": ..., "seg_path": ..., "prob_path": ... or None}
+    The reviewer needs all of them loaded at once so they can spot
+    abdominopelvic / axillary / inguinal nodes the primary model would
+    have missed."""
     nrrd_dir = os.path.join(data_root, "nrrd")
-    pred_dir = os.path.join(data_root, "predictions", model_name)
+    pred_root = os.path.join(data_root, "predictions")
+    pred_dir = os.path.join(pred_root, model_name)
     qc_dir   = os.path.join(data_root, "qc", model_name)
+    extra_anatomies = []
+    if os.path.isdir(pred_root):
+        for sub in sorted(os.listdir(pred_root)):
+            if sub == model_name:
+                continue
+            seg_path  = os.path.join(pred_root, sub, f"{case_id}.nrrd")
+            prob_path = os.path.join(pred_root, sub, f"{case_id}-prob.nrrd")
+            if not os.path.isfile(seg_path):
+                continue
+            extra_anatomies.append({
+                "name": sub,
+                "seg_path": seg_path,
+                "prob_path": prob_path if os.path.isfile(prob_path) else None,
+            })
     return {
         "ct":         _opt(os.path.join(nrrd_dir, f"{case_id}_0000.nrrd")),
         "gt":         _opt(os.path.join(nrrd_dir, f"{case_id}.nrrd")),
         "model_seg":  _opt(os.path.join(pred_dir, f"{case_id}.nrrd")),
         "model_prob": _opt(os.path.join(pred_dir, f"{case_id}-prob.nrrd")),
         "tooltip_png": _opt(os.path.join(qc_dir, f"{case_id}.png")),
+        "extra_anatomies": extra_anatomies,
     }
 
 
@@ -101,17 +125,13 @@ def _maybe_float(s):
         return None
 
 
-class _SortableItem(qt.QTableWidgetItem):
-    """QTableWidgetItem that sorts by a stashed UserRole numeric value
-    rather than the displayed string. Crucial — without this Qt sorts
-    "0.7" > "0.45" lexically and you get the wrong order."""
-    def __lt__(self, other):
-        a = self.data(qt.Qt.UserRole)
-        b = other.data(qt.Qt.UserRole) if isinstance(other, qt.QTableWidgetItem) else None
-        if a is None and b is None: return False
-        if a is None: return True
-        if b is None: return False
-        return a < b
+# Sort role for numeric columns. Qt's QSortFilterProxyModel compares
+# this role via QVariant — so a Python float stashed here sorts
+# numerically, while the displayed cell text stays human-readable.
+# Subclassing QTableWidgetItem and overriding __lt__ does NOT work
+# under PythonQt (Slicer's binding) — operator< is C++-only there,
+# which is why the previous _SortableItem class sorted lexically.
+_SORT_ROLE = qt.Qt.UserRole + 100
 
 
 class CohortListSection(qt.QObject):
@@ -193,18 +213,26 @@ class CohortListSection(qt.QObject):
         self._hintLabel.setStyleSheet("color: gray; padding-bottom: 4px;")
         v.addWidget(self._hintLabel)
 
-        self._table = qt.QTableWidget()
-        self._table.setColumnCount(len(COLUMNS))
-        self._table.setHorizontalHeaderLabels([c[0] for c in COLUMNS])
-        self._table.horizontalHeader().setStretchLastSection(False)
+        # QTableView + QStandardItemModel + QSortFilterProxyModel so
+        # numeric sort honors the float stashed in _SORT_ROLE. The older
+        # QTableWidget + __lt__ override approach silently fell back to
+        # lexical sort under PythonQt.
+        self._model = qt.QStandardItemModel()
+        self._model.setColumnCount(len(COLUMNS))
+        self._model.setHorizontalHeaderLabels([c[0] for c in COLUMNS])
+        self._proxy = qt.QSortFilterProxyModel()
+        self._proxy.setSourceModel(self._model)
+        self._proxy.setSortRole(_SORT_ROLE)
+        self._table = qt.QTableView()
+        self._table.setModel(self._proxy)
         self._table.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self._table.setSelectionMode(qt.QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
         self._table.setSortingEnabled(True)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
-        self._table.connect("itemDoubleClicked(QTableWidgetItem*)",
-                            self._onRowDoubleClicked)
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.doubleClicked.connect(self._onRowDoubleClicked)
         v.addWidget(self._table, 1)
 
     # ----- cohort load -----
@@ -268,46 +296,49 @@ class CohortListSection(qt.QObject):
 
     def _populateTable(self, rows):
         self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(rows))
+        self._model.removeRows(0, self._model.rowCount())
+        self._model.setRowCount(len(rows))
         for r_idx, row in enumerate(rows):
             for c_idx, (_label, key, align, kind) in enumerate(COLUMNS):
                 item = self._buildCell(row, key, kind)
-                if item is None:
-                    item = _SortableItem("")
-                item.setTextAlignment(align | qt.Qt.AlignVCenter)
-                # First column also carries the case_id payload for the
-                # double-click handler.
+                item.setTextAlignment(int(align | qt.Qt.AlignVCenter))
                 if c_idx == 0:
-                    item.setData(qt.Qt.UserRole + 1, row.get("case_id"))
-                # Tooltip on every cell in the row points at the PNG.
+                    # Case-id payload for the double-click handler.
+                    item.setData(row.get("case_id"), qt.Qt.UserRole + 1)
                 tooltip = self._buildTooltip(row.get("case_id"))
                 if tooltip:
                     item.setToolTip(tooltip)
-                self._table.setItem(r_idx, c_idx, item)
+                self._model.setItem(r_idx, c_idx, item)
         self._table.resizeColumnsToContents()
-        # Stretch the last column so the visual edges are clean.
         self._table.horizontalHeader().setSectionResizeMode(
             len(COLUMNS) - 1, qt.QHeaderView.Stretch)
         self._table.setSortingEnabled(True)
 
     def _buildCell(self, row, key, kind):
+        """Return a QStandardItem with the displayed text in DisplayRole
+        and the *sortable* value in _SORT_ROLE (float for numeric kinds,
+        string for case_id). Empty cells get a -inf sort value so they
+        sink to the bottom of any ascending numeric sort."""
         val = row.get(key)
         if kind == "str":
-            it = _SortableItem(str(val or ""))
-            it.setData(qt.Qt.UserRole, str(val or ""))
+            it = qt.QStandardItem(str(val or ""))
+            it.setData(str(val or ""), _SORT_ROLE)
             return it
-        # numeric kinds
         try:
             f = float(val) if val not in (None, "", "True", "False") else None
         except (TypeError, ValueError):
             f = None
         if f is None:
-            it = _SortableItem("")
+            it = qt.QStandardItem("")
+            # NaN sentinel — QSortFilterProxyModel treats NaN consistently
+            # (bottom in both directions) so empty cells don't elbow real
+            # data when the user sorts.
+            it.setData(float("-inf"), _SORT_ROLE)
             return it
         fmt = {"num2": "{:.2f}", "num3": "{:.3f}", "num4": "{:.4f}",
                 "delta": "{:+.4f}"}.get(kind, "{}")
-        it = _SortableItem(fmt.format(f))
-        it.setData(qt.Qt.UserRole, f)
+        it = qt.QStandardItem(fmt.format(f))
+        it.setData(f, _SORT_ROLE)
         return it
 
     def _buildTooltip(self, case_id):
@@ -326,8 +357,12 @@ class CohortListSection(qt.QObject):
             f"<div><b>{case_id}</b><br>"
             f"<img src=\"file://{png}\" width=\"320\"></div>")
 
-    def _onRowDoubleClicked(self, item):
-        case_id_item = self._table.item(item.row(), 0)
+    def _onRowDoubleClicked(self, proxyIndex):
+        # proxyIndex is in the QSortFilterProxyModel's coordinates; map
+        # back to the source QStandardItemModel before pulling the cell.
+        sourceIndex = self._proxy.mapToSource(proxyIndex)
+        row = sourceIndex.row()
+        case_id_item = self._model.item(row, 0)
         case_id = case_id_item.data(qt.Qt.UserRole + 1) if case_id_item else None
         if case_id:
             logging.info("LNQReview: case activated %s", case_id)
