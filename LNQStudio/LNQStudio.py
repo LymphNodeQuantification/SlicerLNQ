@@ -1478,7 +1478,10 @@ class WorklistWindow(qt.QWidget):
 
     def _onInferenceCaseActivated(self, case_id):
         """Cohort table row double-clicked. Switch to LNQReview module
-        and hand it the case to load."""
+        and hand it the case to load. Raise the Slicer main window on
+        top of the worklist so the reviewer's eye lands on the slice
+        views they just summoned (the worklist is a separate top-level
+        QMainWindow and otherwise stays above Slicer on macOS)."""
         if self._inferenceCohortSection is None:
             return
         data_root = self._inferenceCohortSection.dataRoot
@@ -1492,6 +1495,10 @@ class WorklistWindow(qt.QWidget):
                 slicer.util.errorDisplay(
                     "LNQReview module is registered but doesn't expose "
                     "loadFromCohort() — check the SlicerLNQ install.")
+            main = slicer.util.mainWindow()
+            if main is not None:
+                main.raise_()
+                main.activateWindow()
         except Exception as exc:
             logging.exception("Inference Review activation failed")
             slicer.util.errorDisplay(
