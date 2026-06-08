@@ -35,16 +35,22 @@ import slicer
 # Columns shown in the table, in display order. The list of (header,
 # csv_key, alignment, kind) is the single source of truth — adding a
 # column here is the only change needed to surface a new QC stat.
+# The trailing non-mediastinal anatomy columns are populated by running
+# idc-batch-qc.py with --extra-anatomies; cells stay blank for cohorts
+# that haven't had those models run yet (the QC writer emits "" then).
 COLUMNS = [
-    ("Case",                "case_id",                   qt.Qt.AlignLeft,   "str"),
-    ("Δ rescue",            "_rescue",                   qt.Qt.AlignRight,  "delta"),
-    ("Dice p≥0.5",          "dice_p0.5",                 qt.Qt.AlignRight,  "num4"),
-    ("Dice p≥0.001",        "dice_p0.001",               qt.Qt.AlignRight,  "num4"),
-    ("Sens p≥0.5",          "sensitivity_p0.5",          qt.Qt.AlignRight,  "num3"),
-    ("Prec p≥0.5",          "precision_p0.5",            qt.Qt.AlignRight,  "num3"),
-    ("GT (mL)",             "gt_volume_mL",              qt.Qt.AlignRight,  "num2"),
-    ("Pred p≥0.5 (mL)",     "pred_volume_mL_p0.5",       qt.Qt.AlignRight,  "num2"),
-    ("Missed > p≥0.001",    "missed_above_p0.001_frac",  qt.Qt.AlignRight,  "num3"),
+    ("Case",                "case_id",                       qt.Qt.AlignLeft,   "str"),
+    ("Δ rescue",            "_rescue",                       qt.Qt.AlignRight,  "delta"),
+    ("Dice p≥0.5",          "dice_p0.5",                     qt.Qt.AlignRight,  "num4"),
+    ("Dice p≥0.001",        "dice_p0.001",                   qt.Qt.AlignRight,  "num4"),
+    ("Sens p≥0.5",          "sensitivity_p0.5",              qt.Qt.AlignRight,  "num3"),
+    ("Prec p≥0.5",          "precision_p0.5",                qt.Qt.AlignRight,  "num3"),
+    ("GT (mL)",             "gt_volume_mL",                  qt.Qt.AlignRight,  "num2"),
+    ("Pred p≥0.5 (mL)",     "pred_volume_mL_p0.5",           qt.Qt.AlignRight,  "num2"),
+    ("Missed > p≥0.001",    "missed_above_p0.001_frac",      qt.Qt.AlignRight,  "num3"),
+    ("Abd/pelv (mL)",       "abdominopelvic-v1_volume_mL",   qt.Qt.AlignRight,  "num2"),
+    ("Axillary (mL)",       "axillary-v1_volume_mL",         qt.Qt.AlignRight,  "num2"),
+    ("Inguinal (mL)",       "inguinal-v1_volume_mL",         qt.Qt.AlignRight,  "num2"),
 ]
 
 

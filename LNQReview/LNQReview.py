@@ -121,9 +121,10 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
                     sid = seg.GetNthSegmentID(0)
                     s = seg.GetSegment(sid)
                     s.SetName("Ground truth")
-                    # Pure bright red so the outline reads against the
-                    # darker CT background of mediastinal scans.
-                    s.SetColor(1.0, 0.0, 0.0)
+                    # Pale-yellow GT — reads as a "safety" reference layer
+                    # against both the dark CT and the magenta model SEG
+                    # without competing with the red CT contrast.
+                    s.SetColor(1.0, 0.95, 0.55)
                 disp = out["gt"].GetDisplayNode()
                 if disp is not None:
                     # Outline-only for the GT so it doesn't obscure the
@@ -134,6 +135,11 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
                     disp.SetOpacity2DFill(0.15)
                     disp.SetVisibility2DOutline(True)
                     disp.SetOpacity2DOutline(1.0)
+                    # 3D representation lives behind the model SEG +
+                    # probability VR; ~1/3 opacity keeps all three layers
+                    # legible at once in the 3D view.
+                    disp.SetVisibility3D(True)
+                    disp.SetOpacity3D(0.33)
         if paths.get("model_seg") and os.path.isfile(paths["model_seg"]):
             out["model_seg"] = slicer.util.loadSegmentation(paths["model_seg"])
             if out["model_seg"] is not None:
@@ -149,6 +155,8 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
                     disp.SetVisibility2DFill(True)
                     disp.SetOpacity2DFill(0.35)
                     disp.SetVisibility2DOutline(True)
+                    disp.SetVisibility3D(True)
+                    disp.SetOpacity3D(0.33)
         if paths.get("model_prob") and os.path.isfile(paths["model_prob"]):
             out["model_prob"] = slicer.util.loadVolume(
                 paths["model_prob"], properties={"show": False})
@@ -158,10 +166,13 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def setupSliceViewOverlay(ct_node, prob_node, segmentation_nodes):
-        """Wire the Red slice view: CT as background, probability as
-        foreground (Inferno colormap), segmentations layered on top."""
+        """Wire all 3 slice views (Red/Yellow/Green) of the FourUp layout:
+        CT background, probability as Inferno foreground on top,
+        segmentations layered above. Reviewer can scan axial/coronal/
+        sagittal simultaneously. Slice views are linked so panning and
+        zooming in any one moves the other two in lockstep."""
         layoutManager = slicer.app.layoutManager()
-        for color in ("Red",):
+        for color in ("Red", "Yellow", "Green"):
             sw = layoutManager.sliceWidget(color)
             if sw is None:
                 continue
@@ -171,6 +182,11 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
             if prob_node is not None:
                 cn.SetForegroundVolumeID(prob_node.GetID())
                 cn.SetForegroundOpacity(0.55)
+            # Linked navigation: any FOV / offset change propagates to the
+            # other two slice views in the FourUp layout. Hot-link extends
+            # that to the linked control widgets in the slice toolbar.
+            cn.SetLinkedControl(True)
+            cn.SetHotLinkedControl(True)
             sw.sliceLogic().FitSliceToAll()
         # Inferno colormap on the probability volume.
         if prob_node is not None:
@@ -180,6 +196,296 @@ class LNQReviewLogic(ScriptedLoadableModuleLogic):
                         or slicer.util.getFirstNodeByName("FullRainbow"))
                 if heat is not None:
                     disp.SetAndObserveColorNodeID(heat.GetID())
+
+    @staticmethod
+    def buildClosedSurfaces(seg_nodes):
+        """Ensure each segmentation has a closed-surface representation
+        so the 3D view can render the segments without the user having
+        to flip the 'show 3D' switch in the SegmentEditor."""
+        for n in seg_nodes:
+            if n is None:
+                continue
+            try:
+                n.CreateClosedSurfaceRepresentation()
+            except Exception as exc:
+                logging.warning("CreateClosedSurfaceRepresentation %s: %s",
+                                n.GetName(), exc)
+
+    @staticmethod
+    def segmentationsCenter(seg_nodes, reference_volume):
+        """Centroid (RAS) of the union of non-zero voxels across the
+        provided segmentations, resampled onto reference_volume's grid.
+        Used to jump slice offsets and frame the 3D view. Returns None if
+        every segmentation is empty or reference_volume is missing.
+
+        Why not GetRASBounds: that method reports the *source-volume*
+        bounds on a segmentation node — i.e. the whole CT — so it picks
+        the middle of the patient rather than the middle of the
+        lymph-node cluster. Walk the labelmap representation on the CT
+        grid instead and average the non-zero IJK indices, then convert
+        through the CT's IJK→RAS matrix to land in world coordinates."""
+        if reference_volume is None:
+            return None
+        import numpy as np
+        ijk_sum = np.zeros(3, dtype=np.float64)
+        ijk_count = 0
+        for n in seg_nodes:
+            if n is None:
+                continue
+            sid = n.GetSegmentation().GetNthSegmentID(0) if n.GetSegmentation() else None
+            if sid is None:
+                continue
+            try:
+                arr = slicer.util.arrayFromSegmentBinaryLabelmap(
+                    n, sid, reference_volume)
+            except Exception:
+                continue
+            if arr is None or arr.size == 0:
+                continue
+            nz = np.argwhere(arr > 0)            # (N, 3) in k, j, i order
+            if nz.size == 0:
+                continue
+            ijk_sum += np.flip(nz, axis=1).sum(axis=0)   # → i, j, k
+            ijk_count += nz.shape[0]
+        if ijk_count == 0:
+            return None
+        ijk_mean = ijk_sum / ijk_count
+        m = vtk.vtkMatrix4x4()
+        reference_volume.GetIJKToRASMatrix(m)
+        homogeneous = [ijk_mean[0], ijk_mean[1], ijk_mean[2], 1.0]
+        out = [0.0, 0.0, 0.0, 0.0]
+        m.MultiplyPoint(homogeneous, out)
+        return [out[0], out[1], out[2]]
+
+    @staticmethod
+    def jumpSlicesToRAS(ras):
+        """Drop each slice view onto the given RAS point. Uses JumpAllSlices
+        so Red/Yellow/Green move together to the same world coordinate."""
+        if ras is None:
+            return
+        slicer.modules.markups.logic().JumpSlicesToLocation(
+            ras[0], ras[1], ras[2], True)
+
+    @staticmethod
+    def segmentationsExtent(seg_nodes, reference_volume, pad_mm=30.0):
+        """RAS bounding-box half-extents (mm) for the union of non-zero
+        voxels across `seg_nodes`, padded so the slice views show some
+        anatomical context around the cluster. Returned as (dR, dA, dS)
+        so callers can size each slice view's FOV per axis."""
+        if reference_volume is None:
+            return None
+        import numpy as np
+        ijk_min = np.array([+1e18] * 3, dtype=np.float64)
+        ijk_max = np.array([-1e18] * 3, dtype=np.float64)
+        any_filled = False
+        for n in seg_nodes:
+            if n is None:
+                continue
+            sid = n.GetSegmentation().GetNthSegmentID(0) if n.GetSegmentation() else None
+            if sid is None:
+                continue
+            try:
+                arr = slicer.util.arrayFromSegmentBinaryLabelmap(
+                    n, sid, reference_volume)
+            except Exception:
+                continue
+            if arr is None or arr.size == 0:
+                continue
+            nz = np.argwhere(arr > 0)
+            if nz.size == 0:
+                continue
+            any_filled = True
+            ijk_min = np.minimum(ijk_min, np.flip(nz, axis=1).min(axis=0))
+            ijk_max = np.maximum(ijk_max, np.flip(nz, axis=1).max(axis=0))
+        if not any_filled:
+            return None
+        m = vtk.vtkMatrix4x4()
+        reference_volume.GetIJKToRASMatrix(m)
+        ras_corners = []
+        for di in (ijk_min[0], ijk_max[0]):
+            for dj in (ijk_min[1], ijk_max[1]):
+                for dk in (ijk_min[2], ijk_max[2]):
+                    out = [0.0] * 4
+                    m.MultiplyPoint([di, dj, dk, 1.0], out)
+                    ras_corners.append(out[:3])
+        import numpy as np
+        ras_corners = np.array(ras_corners)
+        ras_min = ras_corners.min(axis=0)
+        ras_max = ras_corners.max(axis=0)
+        return (
+            0.5 * (ras_max[0] - ras_min[0]) + pad_mm,
+            0.5 * (ras_max[1] - ras_min[1]) + pad_mm,
+            0.5 * (ras_max[2] - ras_min[2]) + pad_mm,
+        )
+
+    @staticmethod
+    def zoomSlicesToExtent(extent):
+        """Set each slice view's FOV so its in-plane axes contain the
+        provided RAS half-extents while preserving the viewport's pixel
+        aspect ratio. extent = (dR, dA, dS).
+
+        Each slice viewer has a fixed pixel aspect ratio determined by
+        the layout; if we set FOV (W, H) that doesn't match the pixel
+        aspect, Slicer stretches the rendered image non-uniformly. The
+        right play is: pick whichever axis is the limiting one
+        (segmentation half-width / viewport_aspect vs. segmentation
+        half-height), use that as the FOV's dominant dimension, and let
+        the other axis grow to fill — so the segmentation just fits and
+        the aspect ratio is preserved.
+
+        Axial (Red) shows R/A in-plane; Green coronal shows R/S; Yellow
+        sagittal shows A/S. Composite nodes are linked, so a slice
+        offset change in one propagates — but FOV doesn't auto-sync,
+        which is why we set each view explicitly."""
+        if extent is None:
+            return
+        dR, dA, dS = extent
+        lm = slicer.app.layoutManager()
+        plans = [
+            ("Red",    2 * dR, 2 * dA),
+            ("Green",  2 * dR, 2 * dS),
+            ("Yellow", 2 * dA, 2 * dS),
+        ]
+        for color, want_w, want_h in plans:
+            sw = lm.sliceWidget(color)
+            if sw is None:
+                continue
+            node = sw.mrmlSliceNode()
+            if node is None:
+                continue
+            dims = node.GetDimensions()
+            if not dims or len(dims) < 2 or dims[0] <= 0 or dims[1] <= 0:
+                continue
+            viewport_aspect = float(dims[1]) / float(dims[0])
+            # Choose FOV so both desired half-extents are inside the
+            # viewport, preserving the viewport's H/W ratio.
+            fov_w = max(want_w, want_h / viewport_aspect)
+            fov_h = fov_w * viewport_aspect
+            current = node.GetFieldOfView()
+            depth = current[2] if current and len(current) >= 3 else 1.0
+            node.SetFieldOfView(fov_w, fov_h, depth)
+
+    @staticmethod
+    def frame3DViewOnRAS(ras, half_extent_mm=80.0):
+        """Aim the active 3D camera at the given RAS point and pull in
+        the dolly so a ~2*half_extent_mm window around the focal point
+        fills the view. Without an explicit zoom the 3D view frames the
+        whole probability volume (~50 cm tall on chest CTs) and the LN
+        cluster sits as a ~10-px speck. Also turns off the box / axis
+        labels so the volume-rendered iso-shell reads cleanly against
+        the dark background."""
+        if ras is None:
+            return
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager.threeDViewCount == 0:
+            return
+        viewWidget = layoutManager.threeDWidget(0)
+        view = viewWidget.threeDView()
+        viewNode = view.mrmlViewNode()
+        if viewNode is not None:
+            viewNode.SetBoxVisible(False)
+            viewNode.SetAxisLabelsVisible(False)
+        cam = view.cameraNode()
+        if cam is None:
+            view.resetFocalPoint()
+            view.resetCamera()
+            return
+        cam.SetFocalPoint(ras[0], ras[1], ras[2])
+        # Look from the anterior (RAS +A) so the slice we just jumped to
+        # is roughly head-on; offset is far enough that the parallel-
+        # projection / clipping planes don't trim the volume.
+        position = [ras[0], ras[1] + 4 * half_extent_mm, ras[2]]
+        cam.SetPosition(position[0], position[1], position[2])
+        cam.SetViewUp(0.0, 0.0, 1.0)
+        camRaw = cam.GetCamera()
+        if camRaw is not None:
+            # ParallelScale = half the vertical extent in world units. Pull
+            # in the dolly to roughly the LN cluster's bounding sphere.
+            camRaw.SetParallelScale(half_extent_mm)
+            camRaw.SetClippingRange(half_extent_mm * 0.5,
+                                     half_extent_mm * 8.0)
+        view.scheduleRender()
+
+    # ----- probability volume rendering -----
+
+    @staticmethod
+    def setupProbabilityVolumeRendering(prob_node, threshold):
+        """Configure the volume-rendering display node for the probability
+        map so it shows a thin opacity 'spike' at the current slice
+        threshold. The spike acts like an iso-surface outline in 3D —
+        anywhere the probability map crosses p == threshold renders a
+        narrow band, so the reviewer sees the same iso-surface in 3D that
+        the slice threshold drives in 2D. Updates by re-calling this
+        function when the slider changes."""
+        if prob_node is None:
+            return None
+        vrLogic = slicer.modules.volumerendering.logic()
+        disp = vrLogic.GetFirstVolumeRenderingDisplayNode(prob_node)
+        if disp is None:
+            disp = vrLogic.CreateDefaultVolumeRenderingNodes(prob_node)
+        if disp is None:
+            return None
+        disp.SetVisibility(True)
+        LNQReviewLogic._updateProbabilityVRTransferFunction(disp, threshold)
+        return disp
+
+    @staticmethod
+    def _updateProbabilityVRTransferFunction(disp, threshold):
+        """Build the spike opacity + Inferno-colored RGB transfer function
+        on the probability VR display node. The band is sized in
+        *log space* (half a decade on each side of the threshold) so it
+        stays visible regardless of how deep the slider is — at p=0.001
+        a linear ±10% band would be 1e-4 wide, well below the ray-caster's
+        sampling density."""
+        if disp is None:
+            return
+        propNode = disp.GetVolumePropertyNode()
+        if propNode is None:
+            return
+        prop = propNode.GetVolumeProperty()
+        if prop is None:
+            return
+        import math
+        t = max(1e-5, min(0.999, float(threshold)))
+        # Half a decade in log space (factor ~3.16). Stays narrow enough
+        # to read as an outline while leaving the inner / outer core
+        # transparent for context.
+        log_eps = 0.5
+        lo = max(1e-6, t / (10 ** log_eps))
+        hi = min(1.0,  t * (10 ** log_eps))
+
+        opacity = prop.GetScalarOpacity()
+        opacity.RemoveAllPoints()
+        opacity.AddPoint(0.0, 0.0)
+        opacity.AddPoint(lo,   0.0)
+        opacity.AddPoint(t,    1.0)
+        opacity.AddPoint(hi,   0.0)
+        opacity.AddPoint(1.0,  0.0)
+
+        rgb = prop.GetRGBTransferFunction()
+        rgb.RemoveAllPoints()
+        # Inferno-ish — dark purple at low p, hot yellow at the spike,
+        # tapering to white at high p. The non-spike colors are invisible
+        # (opacity 0) but Slicer still needs them defined.
+        rgb.AddRGBPoint(0.0, 0.05, 0.03, 0.18)
+        rgb.AddRGBPoint(lo,  0.40, 0.10, 0.40)
+        rgb.AddRGBPoint(t,   1.00, 0.75, 0.10)
+        rgb.AddRGBPoint(hi,  0.95, 0.55, 0.10)
+        rgb.AddRGBPoint(1.0, 1.00, 0.95, 0.85)
+
+        # No gradient opacity contribution — let the scalar spike alone
+        # drive the outline (gradient opacity here would dim the band on
+        # smoothly-varying regions of the probability map).
+        gradOpacity = prop.GetGradientOpacity()
+        gradOpacity.RemoveAllPoints()
+        gradOpacity.AddPoint(0.0, 1.0)
+        gradOpacity.AddPoint(255.0, 1.0)
+
+        prop.SetShade(True)
+        prop.SetAmbient(0.35)
+        prop.SetDiffuse(0.65)
+        prop.SetSpecular(0.10)
+        prop.SetInterpolationTypeToLinear()
 
 
 # =============================================================================
@@ -206,6 +512,7 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         self._currentCohortModel = ""
         self._currentCaseId = ""
         self._lastAutoThreshold = None       # remembered for the Reset button
+        self._probVRDisplayNode = None       # vtkMRMLVolumeRenderingDisplayNode
 
     # ----- module entry / exit -----
 
@@ -529,6 +836,11 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         threshold = ThresholdController.sliderToThreshold(value)
         self._threshold.setThreshold(threshold)
         self._thresholdValueLabel.setText(f"p ≥ {threshold:.4g}")
+        # Push the 3D iso-band along with the 2D threshold so the
+        # reviewer sees the same surface in both views.
+        if self._probVRDisplayNode is not None:
+            self.logic._updateProbabilityVRTransferFunction(
+                self._probVRDisplayNode, threshold)
         self._refreshAutoResetButton()
 
     def _stepThreshold(self, direction):
@@ -608,7 +920,8 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         disp = gt.GetDisplayNode()
         if disp is None:
             return
-        # Button is checkable: checked == "hidden".
+        # Button is checkable: checked == "hidden". SetVisibility() drops
+        # both 2D + 3D in one call so the toggle affects every viewer.
         hide = self._gtVisibleButton.isChecked()
         disp.SetVisibility(not hide)
         self._gtVisibleButton.setText(
@@ -630,14 +943,17 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
         prob = self._sceneNodes.get("model_prob") if self._sceneNodes else None
         if prob is None:
             return
-        # Foreground volume in every slice viewer. Setting opacity to 0
-        # is the standard way to suppress the foreground layer without
-        # tearing it down.
+        # 2D foreground in every slice viewer + the 3D VR display node
+        # get hidden together so the toggle catches all three viewports.
+        # Setting foreground opacity to 0 is the standard way to suppress
+        # the slice layer without tearing it down.
         hide = self._overlayVisibleButton.isChecked()
         opacity = 0.0 if hide else 0.55
         for c in slicer.app.layoutManager().sliceViewNames():
             cn = slicer.app.layoutManager().sliceWidget(c).sliceLogic().GetSliceCompositeNode()
             cn.SetForegroundOpacity(opacity)
+        if self._probVRDisplayNode is not None:
+            self._probVRDisplayNode.SetVisibility(not hide)
         self._overlayVisibleButton.setText(
             "Show probability overlay" if hide else "Hide probability overlay")
 
@@ -704,8 +1020,19 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
             slicer.mrmlScene.RemoveNode(n)
         for n in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
             slicer.mrmlScene.RemoveNode(n)
+        for n in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
+            slicer.mrmlScene.RemoveNode(n)
+        # The prior VR pointer just became invalid; null it before the
+        # threshold slider can fire and touch a dangling node.
+        self._probVRDisplayNode = None
         if self._prompts is not None:
             self._prompts.clearAll()
+
+        # Reviewer asked for 4-up so axial/coronal/sagittal + 3D are all
+        # visible at the same time; the threshold-coupled probability VR
+        # only makes sense if the 3D view is on screen.
+        slicer.app.layoutManager().setLayout(
+            slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
 
         load_paths = {"ct": paths["ct"], "gt": paths["gt"],
                        "model_seg": paths["model_seg"],
@@ -716,6 +1043,32 @@ class LNQReviewWidget(ScriptedLoadableModuleWidget):
             [self._sceneNodes["gt"], self._sceneNodes["model_seg"]])
         if self._sceneNodes["model_prob"]:
             self._threshold.setProbabilityVolume(self._sceneNodes["model_prob"])
+
+        # 3D pipeline: closed-surface meshes for the segmentations + a
+        # spike-opacity volume rendering of the probability map. The VR
+        # is recomputed each time the threshold slider moves so the 3D
+        # iso-band tracks what the slice views are showing.
+        self.logic.buildClosedSurfaces(
+            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]])
+        self._probVRDisplayNode = self.logic.setupProbabilityVolumeRendering(
+            self._sceneNodes["model_prob"], self._threshold.threshold)
+        center = self.logic.segmentationsCenter(
+            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]],
+            self._sceneNodes["ct"])
+        extent = self.logic.segmentationsExtent(
+            [self._sceneNodes["gt"], self._sceneNodes["model_seg"]],
+            self._sceneNodes["ct"])
+        if center is not None:
+            self.logic.jumpSlicesToRAS(center)
+            if extent is not None:
+                self.logic.zoomSlicesToExtent(extent)
+                # Match the 3D camera dolly to the biggest in-plane
+                # half-extent so the LN cluster fills the 3D view the
+                # same way it fills the slice views.
+                self.logic.frame3DViewOnRAS(center,
+                    half_extent_mm=max(extent) * 1.2)
+            else:
+                self.logic.frame3DViewOnRAS(center)
 
         # Apply whatever CT preset the dropdown is currently set to.
         if hasattr(self, "_ctPresetCombo"):
