@@ -1495,10 +1495,22 @@ class WorklistWindow(qt.QWidget):
                 slicer.util.errorDisplay(
                     "LNQReview module is registered but doesn't expose "
                     "loadFromCohort() — check the SlicerLNQ install.")
+            # Raise Slicer over the worklist after the double-click
+            # signal handler returns. Direct raise_() from inside the
+            # handler is fighting macOS's focus state — the worklist
+            # received the click and Qt re-activates it as the handler
+            # unwinds, so the raise never sticks. Defer to the next
+            # event-loop tick and lower the worklist to break the tie.
             main = slicer.util.mainWindow()
-            if main is not None:
-                main.raise_()
-                main.activateWindow()
+            worklist = self
+            def _bringSlicerForward():
+                if main is not None:
+                    main.show()
+                    main.raise_()
+                    main.activateWindow()
+                if worklist is not None:
+                    worklist.lower()
+            qt.QTimer.singleShot(0, _bringSlicerForward)
         except Exception as exc:
             logging.exception("Inference Review activation failed")
             slicer.util.errorDisplay(
