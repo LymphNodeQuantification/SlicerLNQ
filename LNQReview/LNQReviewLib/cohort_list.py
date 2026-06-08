@@ -120,13 +120,28 @@ class CohortListSection(qt.QObject):
 
     caseActivated = qt.Signal(str)   # case_id
 
+    # QSettings keys for the most recently loaded cohort. Restored on
+    # construction + saved on every successful Load click so reviewers
+    # don't have to re-browse on each Slicer restart.
+    _SETTINGS_DATA_ROOT_KEY = "LNQReview/cohortDataRoot"
+    _SETTINGS_MODEL_KEY = "LNQReview/cohortModelName"
+
     def __init__(self, parent=None):
         qt.QObject.__init__(self, parent)
-        self._dataRoot = ""
-        self._modelName = "mediastinal-v1"
+        s = qt.QSettings()
+        self._dataRoot = s.value(self._SETTINGS_DATA_ROOT_KEY, "") or ""
+        self._modelName = s.value(self._SETTINGS_MODEL_KEY, "") or "mediastinal-v1"
         self._rows = []
         self._widget = qt.QWidget()
         self._buildUI()
+        # Auto-load if the remembered cohort still exists on disk. Falls
+        # through silently otherwise — the user sees the picker.
+        if self._dataRoot and os.path.isdir(self._dataRoot):
+            try:
+                self._onLoadCohort()
+            except Exception as exc:
+                logging.warning("auto-load of remembered cohort failed: %s",
+                                exc)
 
     @property
     def widget(self):
@@ -145,9 +160,10 @@ class CohortListSection(qt.QObject):
     def _buildUI(self):
         v = qt.QVBoxLayout(self._widget)
 
-        # Cohort picker row.
+        # Cohort picker row. Pre-fills from QSettings so the most-recently
+        # loaded cohort is one click away on the next Slicer launch.
         row = qt.QHBoxLayout()
-        self._rootEdit = qt.QLineEdit()
+        self._rootEdit = qt.QLineEdit(self._dataRoot)
         self._rootEdit.setPlaceholderText(
             "Data root (e.g. /media/share/LNQ-data/idc/ct_lymph_nodes)")
         browse = qt.QPushButton("Browse…")
@@ -233,6 +249,10 @@ class CohortListSection(qt.QObject):
         self._dataRoot = root
         self._modelName = model
         self._rows = rows
+        # Persist for the next Slicer launch.
+        s = qt.QSettings()
+        s.setValue(self._SETTINGS_DATA_ROOT_KEY, root)
+        s.setValue(self._SETTINGS_MODEL_KEY, model)
         self._populateTable(rows)
         self._statusLabel.setText(
             f"{len(rows)} cases from {csv_path}. Sorted by rescue Δ; "
