@@ -38,6 +38,8 @@ import slicer
 # The trailing non-mediastinal anatomy columns are populated by running
 # idc-batch-qc.py with --extra-anatomies; cells stay blank for cohorts
 # that haven't had those models run yet (the QC writer emits "" then).
+# The Notes column is special: editable in-place; on edit, the new text
+# is persisted to Chronicle via chronicle_notes.write_note().
 COLUMNS = [
     ("Case",                "case_id",                       qt.Qt.AlignLeft,   "str"),
     ("Δ rescue",            "_rescue",                       qt.Qt.AlignRight,  "delta"),
@@ -51,6 +53,7 @@ COLUMNS = [
     ("Abd/pelv (mL)",       "abdominopelvic-v1_volume_mL",   qt.Qt.AlignRight,  "num2"),
     ("Axillary (mL)",       "axillary-v1_volume_mL",         qt.Qt.AlignRight,  "num2"),
     ("Inguinal (mL)",       "inguinal-v1_volume_mL",         qt.Qt.AlignRight,  "num2"),
+    ("Notes",               "_notes",                        qt.Qt.AlignLeft,   "notes"),
 ]
 
 
@@ -152,6 +155,17 @@ class CohortListSection(qt.QObject):
         self._dataRoot = s.value(self._SETTINGS_DATA_ROOT_KEY, "") or ""
         self._modelName = s.value(self._SETTINGS_MODEL_KEY, "") or "mediastinal-v1"
         self._rows = []
+        # Chronicle-backed per-case notes. fetch_notes() on cohort load,
+        # write_note() on each edit. Missing / unreachable Chronicle is
+        # tolerated (the client silently degrades to in-memory).
+        try:
+            from LNQReviewLib.chronicle_notes import ChronicleNotesClient
+            self._notesClient = ChronicleNotesClient()
+        except Exception as exc:
+            logging.warning("ChronicleNotesClient init failed: %s", exc)
+            self._notesClient = None
+        self._notes = {}            # {case_id: text}
+        self._suspendNotesWrite = False
         self._widget = qt.QWidget()
         self._buildUI()
         # Auto-load if the remembered cohort still exists on disk. Falls
@@ -227,12 +241,21 @@ class CohortListSection(qt.QObject):
         self._table.setModel(self._proxy)
         self._table.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self._table.setSelectionMode(qt.QAbstractItemView.SingleSelection)
-        self._table.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        # Notes column is editable on a single click. All other columns
+        # stay read-only; per-cell flags are applied in _buildCell.
+        self._table.setEditTriggers(
+            qt.QAbstractItemView.SelectedClicked
+            | qt.QAbstractItemView.EditKeyPressed
+            | qt.QAbstractItemView.AnyKeyPressed)
         self._table.setSortingEnabled(True)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.doubleClicked.connect(self._onRowDoubleClicked)
+        # Persist edits as they happen. dataChanged fires for every
+        # itemChanged path including programmatic setItem, so we gate
+        # write-back via _suspendNotesWrite during populate.
+        self._model.dataChanged.connect(self._onModelDataChanged)
         v.addWidget(self._table, 1)
 
     # ----- cohort load -----
@@ -281,6 +304,16 @@ class CohortListSection(qt.QObject):
         s = qt.QSettings()
         s.setValue(self._SETTINGS_DATA_ROOT_KEY, root)
         s.setValue(self._SETTINGS_MODEL_KEY, model)
+        # Pull stored notes for this cohort so the Notes column comes up
+        # populated. One bulk POST against _all_docs?include_docs=true.
+        self._notes = {}
+        if self._notesClient is not None and self._notesClient.configured:
+            try:
+                case_ids = [r.get("case_id") for r in rows if r.get("case_id")]
+                self._notes = self._notesClient.fetch_notes(
+                    root, model, case_ids) or {}
+            except Exception as exc:
+                logging.warning("fetch_notes failed: %s", exc)
         self._populateTable(rows)
         self._statusLabel.setText(
             f"{len(rows)} cases from {csv_path}. Sorted by rescue Δ; "
@@ -296,19 +329,31 @@ class CohortListSection(qt.QObject):
 
     def _populateTable(self, rows):
         self._table.setSortingEnabled(False)
-        self._model.removeRows(0, self._model.rowCount())
-        self._model.setRowCount(len(rows))
-        for r_idx, row in enumerate(rows):
-            for c_idx, (_label, key, align, kind) in enumerate(COLUMNS):
-                item = self._buildCell(row, key, kind)
-                item.setTextAlignment(int(align | qt.Qt.AlignVCenter))
-                if c_idx == 0:
-                    # Case-id payload for the double-click handler.
-                    item.setData(row.get("case_id"), qt.Qt.UserRole + 1)
-                tooltip = self._buildTooltip(row.get("case_id"))
-                if tooltip:
-                    item.setToolTip(tooltip)
-                self._model.setItem(r_idx, c_idx, item)
+        self._suspendNotesWrite = True
+        try:
+            self._model.removeRows(0, self._model.rowCount())
+            self._model.setRowCount(len(rows))
+            for r_idx, row in enumerate(rows):
+                case_id = row.get("case_id")
+                # Surface the stored note inline so _buildCell can pick
+                # it up via the row dict.
+                row["_notes"] = self._notes.get(case_id, "")
+                for c_idx, (_label, key, align, kind) in enumerate(COLUMNS):
+                    item = self._buildCell(row, key, kind)
+                    item.setTextAlignment(int(align | qt.Qt.AlignVCenter))
+                    if c_idx == 0:
+                        # Case-id payload for the double-click handler.
+                        item.setData(case_id, qt.Qt.UserRole + 1)
+                    if kind == "notes":
+                        # Stash the case_id on this cell so the on-edit
+                        # slot knows which note to write back.
+                        item.setData(case_id, qt.Qt.UserRole + 1)
+                    tooltip = self._buildTooltip(case_id)
+                    if tooltip:
+                        item.setToolTip(tooltip)
+                    self._model.setItem(r_idx, c_idx, item)
+        finally:
+            self._suspendNotesWrite = False
         self._table.resizeColumnsToContents()
         self._table.horizontalHeader().setSectionResizeMode(
             len(COLUMNS) - 1, qt.QHeaderView.Stretch)
@@ -318,11 +363,22 @@ class CohortListSection(qt.QObject):
         """Return a QStandardItem with the displayed text in DisplayRole
         and the *sortable* value in _SORT_ROLE (float for numeric kinds,
         string for case_id). Empty cells get a -inf sort value so they
-        sink to the bottom of any ascending numeric sort."""
+        sink to the bottom of any ascending numeric sort.
+
+        kind=="notes" cells are the only writable ones — they keep the
+        default ItemIsEditable flag; every other kind clears it so the
+        rest of the table stays read-only."""
         val = row.get(key)
+        if kind == "notes":
+            text = str(val or "")
+            it = qt.QStandardItem(text)
+            it.setData(text, _SORT_ROLE)
+            it.setEditable(True)
+            return it
         if kind == "str":
             it = qt.QStandardItem(str(val or ""))
             it.setData(str(val or ""), _SORT_ROLE)
+            it.setEditable(False)
             return it
         try:
             f = float(val) if val not in (None, "", "True", "False") else None
@@ -357,11 +413,62 @@ class CohortListSection(qt.QObject):
             f"<div><b>{case_id}</b><br>"
             f"<img src=\"file://{png}\" width=\"320\"></div>")
 
+    # ----- notes editing -----
+
+    def _onModelDataChanged(self, topLeft, bottomRight, _roles=None):
+        """Persist the Notes cell to Chronicle when the user finishes
+        editing. Other cells are read-only so won't reach here, but we
+        guard on column index defensively + skip programmatic populate
+        via _suspendNotesWrite."""
+        if self._suspendNotesWrite:
+            return
+        # Identify the Notes column from COLUMNS.
+        notes_col = None
+        for i, c in enumerate(COLUMNS):
+            if c[3] == "notes":
+                notes_col = i
+                break
+        if notes_col is None:
+            return
+        for r in range(topLeft.row(), bottomRight.row() + 1):
+            if topLeft.column() > notes_col or bottomRight.column() < notes_col:
+                continue
+            item = self._model.item(r, notes_col)
+            if item is None:
+                continue
+            case_id = item.data(qt.Qt.UserRole + 1)
+            if not case_id:
+                continue
+            text = item.text() or ""
+            # Keep the sort key in sync with the display text.
+            item.setData(text, _SORT_ROLE)
+            prior = self._notes.get(case_id, "")
+            if text == prior:
+                continue
+            self._notes[case_id] = text
+            if self._notesClient is not None and self._notesClient.configured:
+                try:
+                    ok = self._notesClient.write_note(
+                        self._dataRoot, self._modelName, case_id, text)
+                    if not ok:
+                        logging.warning(
+                            "Chronicle write_note returned non-ok for %s",
+                            case_id)
+                except Exception as exc:
+                    logging.warning("write_note failed for %s: %s",
+                                    case_id, exc)
+
     def _onRowDoubleClicked(self, proxyIndex):
         # proxyIndex is in the QSortFilterProxyModel's coordinates; map
         # back to the source QStandardItemModel before pulling the cell.
         sourceIndex = self._proxy.mapToSource(proxyIndex)
         row = sourceIndex.row()
+        col = sourceIndex.column()
+        # Don't treat a double-click on the Notes column as "activate
+        # case" — the user is trying to enter the editor instead. Qt
+        # will start the edit because the cell is ItemIsEditable.
+        if col < len(COLUMNS) and COLUMNS[col][3] == "notes":
+            return
         case_id_item = self._model.item(row, 0)
         case_id = case_id_item.data(qt.Qt.UserRole + 1) if case_id_item else None
         if case_id:

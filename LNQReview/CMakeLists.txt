@@ -8,6 +8,7 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}Lib/layout.py
   ${MODULE_NAME}Lib/tools.py
   ${MODULE_NAME}Lib/cohort_list.py
+  ${MODULE_NAME}Lib/chronicle_notes.py
   )
 
 set(MODULE_PYTHON_RESOURCES
